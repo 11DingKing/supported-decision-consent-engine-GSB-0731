@@ -1,0 +1,8 @@
+.bundle/
+vendor/bundle/
+coverage/
+*.db
+*.sqlite*
+*.log
+.env
+

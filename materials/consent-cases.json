@@ -1,0 +1,16 @@
+{
+  "personId": "PERSON-01",
+  "supporters": ["SUPPORTER-A", "SUPPORTER-B"],
+  "scopes": ["HOUSING_APPLICATION", "LEGAL_AID_APPLICATION", "MEDICAL_INFORMATION_VIEW"],
+  "consents": [
+    {"id": "CONSENT-1", "supporterId": "SUPPORTER-A", "scopes": ["LEGAL_AID_APPLICATION", "HOUSING_APPLICATION"], "from": "2026-08-01T00:00:00Z", "to": "2026-12-01T00:00:00Z", "witnessId": "W-1"}
+  ],
+  "delegations": [
+    {"id": "DELEG-OK", "sourceConsentId": "CONSENT-1", "fromSupporterId": "SUPPORTER-A", "toSupporterId": "SUPPORTER-B", "scopes": ["LEGAL_AID_APPLICATION"], "to": "2026-10-01T00:00:00Z"},
+    {"id": "DELEG-BROAD", "sourceConsentId": "CONSENT-1", "fromSupporterId": "SUPPORTER-A", "toSupporterId": "SUPPORTER-B", "scopes": ["MEDICAL_INFORMATION_VIEW"]}
+  ],
+  "revocations": [{"id": "REVOKE-1", "consentId": "CONSENT-1", "at": "2026-09-15T10:00:00Z"}],
+  "emergency": {"allowedScope": "LEGAL_AID_APPLICATION", "maxMinutes": 30, "requiresReviewEvent": true},
+  "edgeCases": ["decision at exact revocation instant", "delegation after source expiry", "cycle through multiple delegations"]
+}
+
