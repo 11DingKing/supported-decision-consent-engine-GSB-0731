@@ -103,13 +103,15 @@ post "/persons/:person_id/consents" do
     STORE.in_transaction do |s|
       err = Domain::Validate.consent(world: STORE.world(as_of_seq: s), person_id: params[:person_id],
                                      supporter_id: body["supporterId"], scopes: body["scopes"],
-                                     valid_from: valid_from, valid_to: valid_to, witness_id: body["witnessId"])
+                                     valid_from: valid_from, valid_to: valid_to, witness_id: body["witnessId"],
+                                     emergency_budget_minutes: body["emergencyBudgetMinutes"])
       domain_error(err) if err
       STORE.append_event(type: "CONSENT_GRANTED",
                          payload: { "id" => id, "personId" => params[:person_id],
                                     "supporterId" => body["supporterId"], "scopes" => body["scopes"],
                                     "from" => valid_from.utc.iso8601, "to" => valid_to.utc.iso8601,
-                                    "witnessId" => body["witnessId"] },
+                                    "witnessId" => body["witnessId"],
+                                    "emergencyBudgetMinutes" => body["emergencyBudgetMinutes"] },
                          event_time: valid_from)
       STORE.append_event(type: "WITNESS_RECORDED",
                          payload: { "consentId" => id, "witnessId" => body["witnessId"],
@@ -143,28 +145,53 @@ post "/consents/:consent_id/delegations" do
   effective_from = body["at"] ? parse_time(body["at"], "at") : now_utc
   valid_to = body["to"] && parse_time(body["to"], "to")
   id = body["id"] || "DELEG-#{SecureRandom.uuid}"
+  err = nil
+  rejection_id = nil
   seq = synchronized do
     STORE.in_transaction do |s|
       world = STORE.world(as_of_seq: s)
       root = world.consent_by_id(params[:consent_id])
-      domain_error("SOURCE_CONSENT_UNKNOWN") if root.nil?
+      if root.nil?
+        err = "SOURCE_CONSENT_UNKNOWN"
+        next s
+      end
       from_supporter = body["fromSupporterId"] || root.supporter_id
       err = Domain::Validate.delegation(world: world, source_consent_id: params[:consent_id],
                                         from_supporter_id: from_supporter,
                                         to_supporter_id: body["toSupporterId"],
                                         scopes: body["scopes"],
-                                        effective_from: effective_from, valid_to: valid_to)
-      domain_error(err) if err
-      STORE.append_event(type: "DELEGATION_CREATED",
-                         payload: { "id" => id, "sourceConsentId" => params[:consent_id],
-                                    "fromSupporterId" => from_supporter,
-                                    "toSupporterId" => body["toSupporterId"],
-                                    "scopes" => body["scopes"],
-                                    "effectiveFrom" => effective_from.utc.iso8601,
-                                    "to" => valid_to&.utc&.iso8601 },
-                         event_time: effective_from)
+                                        effective_from: effective_from, valid_to: valid_to,
+                                        emergency_budget_minutes: body["emergencyBudgetMinutes"])
+      if err
+        # Rejected sub-chains leave immutable, scope-redacted evidence: the
+        # stable reason code and the chain that justified the refusal.
+        rejection_id = "REJ-#{SecureRandom.uuid}"
+        evidence = Domain::Evidence.delegation_rejection(world: world, source_consent_id: params[:consent_id],
+                                                         from_supporter_id: from_supporter,
+                                                         to_supporter_id: body["toSupporterId"],
+                                                         attempted_id: id, at: effective_from, reason: err)
+        STORE.append_event(type: "DELEGATION_REJECTED",
+                           payload: { "id" => rejection_id, "attemptedDelegationId" => id,
+                                      "sourceConsentId" => params[:consent_id],
+                                      "fromSupporterId" => from_supporter,
+                                      "toSupporterId" => body["toSupporterId"],
+                                      "reasonCode" => err, "chain" => evidence },
+                           event_time: effective_from)
+      else
+        STORE.append_event(type: "DELEGATION_CREATED",
+                           payload: { "id" => id, "sourceConsentId" => params[:consent_id],
+                                      "fromSupporterId" => from_supporter,
+                                      "toSupporterId" => body["toSupporterId"],
+                                      "scopes" => body["scopes"],
+                                      "effectiveFrom" => effective_from.utc.iso8601,
+                                      "to" => valid_to&.utc&.iso8601,
+                                      "emergencyBudgetMinutes" => body["emergencyBudgetMinutes"] },
+                           event_time: effective_from)
+      end
+      s
     end
   end
+  halt 422, { error: err, rejectionId: rejection_id }.to_json if err
   status 201
   { delegationId: id, seq: seq }.to_json
 end

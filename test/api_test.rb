@@ -184,4 +184,86 @@ class ApiTest < Minitest::Test
     get "/decisions/DEC-nope/replay"
     assert_equal 404, last_response.status
   end
+
+  # --- round 2: sub-delegation evidence, budgets, late arrival ----------------
+
+  def audit_events(type)
+    get "/persons/#{@pid}/audit"
+    body.select { |e| e["type"] == type }
+  end
+
+  def test_rejected_subdelegation_leaves_scope_redacted_evidence
+    post "/consents/#{@consent_id}/delegations",
+         { toSupporterId: @sb, scopes: ["MEDICAL_INFORMATION_VIEW"], at: "2026-08-01T00:00:00Z" }.to_json
+    assert_equal 422, last_response.status
+    assert_equal "DELEGATION_BROADER_THAN_SOURCE", body["error"]
+    assert body["rejectionId"], "rejection must carry an evidence id"
+    rejection_id = body["rejectionId"]
+
+    rejected = audit_events("DELEGATION_REJECTED")
+    assert_equal 1, rejected.size
+    payload = rejected.first["payload"]
+    assert_equal "DELEGATION_BROADER_THAN_SOURCE", payload["reasonCode"]
+    assert_equal rejection_id, payload["id"]
+    assert_equal "rejected", payload["chain"].last["status"]
+
+    # Evidence must not disclose any scope contents — not the requested one
+    # and not the source's.
+    json = payload["chain"].to_json
+    refute_includes json, "MEDICAL_INFORMATION_VIEW"
+    refute_includes json, "LEGAL_AID_APPLICATION"
+    refute_includes json, "HOUSING_APPLICATION"
+    assert_equal 0, audit_events("DELEGATION_CREATED").size
+  end
+
+  def test_cumulative_budget_over_allocation_over_http
+    post "/consents/#{@consent_id}/delegations",
+         { toSupporterId: @sb, scopes: ["LEGAL_AID_APPLICATION"],
+           at: "2026-08-01T00:00:00Z", emergencyBudgetMinutes: 20 }.to_json
+    assert_equal 201, last_response.status
+
+    post "/consents/#{@consent_id}/delegations",
+         { toSupporterId: @sc, scopes: ["LEGAL_AID_APPLICATION"],
+           at: "2026-08-01T00:00:00Z", emergencyBudgetMinutes: 20 }.to_json
+    assert_equal 422, last_response.status
+    assert_equal "DELEGATION_BUDGET_EXCEEDED", body["error"]
+
+    post "/consents/#{@consent_id}/delegations",
+         { toSupporterId: @sc, scopes: ["LEGAL_AID_APPLICATION"],
+           at: "2026-08-01T00:00:00Z", emergencyBudgetMinutes: 10 }.to_json
+    assert_equal 201, last_response.status
+  end
+
+  def test_consent_budget_above_person_policy_rejected
+    post "/persons/#{@pid}/consents",
+         { supporterId: @sb, scopes: ["HOUSING_APPLICATION"],
+           from: "2026-08-01T00:00:00Z", to: "2026-12-01T00:00:00Z",
+           witnessId: "W-2", emergencyBudgetMinutes: 45 }.to_json
+    assert_equal 422, last_response.status
+    assert_equal "CONSENT_BUDGET_EXCEEDS_POLICY", body["error"]
+  end
+
+  def test_late_arriving_subchain_validity_by_event_time_and_seq_over_http
+    post "/consents/#{@consent_id}/revoke", { at: "2026-09-15T10:00:00Z" }.to_json
+    assert_equal 201, last_response.status
+
+    early = evaluate(@sb, "LEGAL_AID_APPLICATION", "2026-09-14T12:00:00Z")
+    assert_equal "DENY_NO_CONSENT", early["reasonCode"]
+
+    # Arrives after the revocation in audit order, effective before it.
+    post "/consents/#{@consent_id}/delegations",
+         { toSupporterId: @sb, scopes: ["LEGAL_AID_APPLICATION"],
+           at: "2026-09-14T00:00:00Z", emergencyBudgetMinutes: 10 }.to_json
+    assert_equal 201, last_response.status
+
+    now = evaluate(@sb, "LEGAL_AID_APPLICATION", "2026-09-14T12:00:00Z")
+    assert_equal "OK_DELEGATED", now["reasonCode"]
+
+    post_revoke = evaluate(@sb, "LEGAL_AID_APPLICATION", "2026-09-15T11:00:00Z")
+    assert_equal "DENY_DELEGATION_SOURCE_REVOKED", post_revoke["reasonCode"]
+
+    get "/decisions/#{early['decisionId']}/replay"
+    assert body["replayMatches"]
+    assert_equal "DENY_NO_CONSENT", body["replay"]["reasonCode"]
+  end
 end

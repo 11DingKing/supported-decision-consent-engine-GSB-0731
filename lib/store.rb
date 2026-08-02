@@ -206,7 +206,7 @@ module WorldBuilder
         consents << Domain::Consent.new(
           id: p["id"], person_id: p["personId"], supporter_id: p["supporterId"],
           scopes: p["scopes"], valid_from: Time.iso8601(p["from"]), valid_to: Time.iso8601(p["to"]),
-          witness_id: p["witnessId"]
+          witness_id: p["witnessId"], emergency_budget_minutes: p["emergencyBudgetMinutes"]
         )
       when "CONSENT_REVOKED"
         # First revocation wins; later duplicates are kept in the log but
@@ -219,7 +219,8 @@ module WorldBuilder
           id: p["id"], source_consent_id: p["sourceConsentId"],
           from_supporter_id: p["fromSupporterId"], to_supporter_id: p["toSupporterId"],
           scopes: p["scopes"], effective_from: Time.iso8601(p["effectiveFrom"]),
-          valid_to: p["to"] && Time.iso8601(p["to"]), created_seq: e.seq
+          valid_to: p["to"] && Time.iso8601(p["to"]), created_seq: e.seq,
+          emergency_budget_minutes: p["emergencyBudgetMinutes"]
         )
       when "EMERGENCY_STARTED"
         emergencies[p["id"]] = Domain::EmergencyEpisode.new(

@@ -24,14 +24,20 @@ module Domain
     DENY_DELEGATION_EXPIRED      = "DENY_DELEGATION_EXPIRED"
     DENY_DELEGATION_SOURCE_EXPIRED = "DENY_DELEGATION_SOURCE_EXPIRED"
     DENY_DELEGATION_SOURCE_REVOKED = "DENY_DELEGATION_SOURCE_REVOKED"
+    DENY_EMERGENCY_BUDGET_EXCEEDED = "DENY_EMERGENCY_BUDGET_EXCEEDED"
     DENY_EMERGENCY_TIMEOUT       = "DENY_EMERGENCY_TIMEOUT"
   end
 
   # Deterministic denial precedence. When several independent facts each
   # justify a denial, the first matching entry wins, so the reason code is
-  # stable across runs and replays.
+  # stable across runs and replays. Emergency denials rank high: an episode
+  # matched to (supporter, scope) is the specific access path, and the
+  # exception is deliberately independent of ordinary consent/delegation
+  # outcomes. A delegation cycle still outranks it (structural corruption).
   DENIAL_PRECEDENCE = [
     Reason::DENY_DELEGATION_CYCLE,
+    Reason::DENY_EMERGENCY_BUDGET_EXCEEDED,
+    Reason::DENY_EMERGENCY_TIMEOUT,
     Reason::DENY_DELEGATION_SOURCE_REVOKED,
     Reason::DENY_DELEGATION_SOURCE_EXPIRED,
     Reason::DENY_DELEGATION_EXPIRED,
@@ -39,18 +45,19 @@ module Domain
     Reason::DENY_CONSENT_REVOKED,
     Reason::DENY_CONSENT_EXPIRED,
     Reason::DENY_SCOPE_NOT_COVERED,
-    Reason::DENY_EMERGENCY_TIMEOUT,
     Reason::DENY_NO_CONSENT
   ].freeze
 
-  Consent = Struct.new(:id, :person_id, :supporter_id, :scopes, :valid_from, :valid_to, :witness_id, keyword_init: true) do
+  Consent = Struct.new(:id, :person_id, :supporter_id, :scopes, :valid_from, :valid_to, :witness_id,
+                       :emergency_budget_minutes, keyword_init: true) do
     # Half-open window [from, to): a consent is active at `from`, expired at `to`.
     def active_at?(t) = valid_from <= t && t < valid_to
     def covers?(scope) = scopes.include?(scope)
   end
 
   Delegation = Struct.new(:id, :source_consent_id, :from_supporter_id, :to_supporter_id,
-                          :scopes, :effective_from, :valid_to, :created_seq, keyword_init: true) do
+                          :scopes, :effective_from, :valid_to, :created_seq,
+                          :emergency_budget_minutes, keyword_init: true) do
     def active_at?(t) = effective_from <= t && (valid_to.nil? || t < valid_to)
     def covers?(scope) = scopes.include?(scope)
   end
@@ -101,17 +108,68 @@ module Domain
 
     # Effective scopes a supporter may further delegate from `source_consent_id`,
     # i.e. the narrowest link along every delegation path leading to them.
-    def effective_delegatable_scopes(source_consent_id, supporter_id)
+    # With `at:`, only paths whose every link is live at that time count.
+    def effective_delegatable_scopes(source_consent_id, supporter_id, at: nil)
       root = consent_by_id(source_consent_id)
       return [] if root.nil?
 
-      paths = delegation_paths(supporter_id).select do |p|
-        p[:root_consent] && p[:root_consent].id == source_consent_id && !p[:cycle]
-      end
+      paths = delegatable_paths(source_consent_id, supporter_id, at: at)
       return root.scopes if supporter_id == root.supporter_id
       return [] if paths.empty?
 
       paths.map { |p| (p[:delegations].map(&:scopes) + [root.scopes]).reduce(:&) }.max_by(&:size) || []
+    end
+
+    # Latest valid_to the supporter may grant downstream: the tightest window
+    # along the chain, never beyond the root consent's own valid_to.
+    def effective_delegatable_window(source_consent_id, supporter_id, at: nil)
+      root = consent_by_id(source_consent_id)
+      return nil if root.nil?
+      return root.valid_to if supporter_id == root.supporter_id
+
+      delegatable_paths(source_consent_id, supporter_id, at: at)
+        .map { |p| ([root.valid_to] + p[:delegations].map(&:valid_to).compact).min }
+        .max
+    end
+
+    # Emergency budget (minutes) a supporter may derive from the source:
+    # direct holder gets the consent budget (falling back to the person's
+    # policy), a delegatee gets the minimum link along the best chain.
+    def effective_emergency_budget(source_consent_id, supporter_id, at: nil)
+      root = consent_by_id(source_consent_id)
+      return 0 if root.nil?
+      return consent_budget(root) if supporter_id == root.supporter_id
+
+      delegatable_paths(source_consent_id, supporter_id, at: at)
+        .map { |p| ([consent_budget(root)] + p[:delegations].map { |d| d.emergency_budget_minutes || 0 }).min }
+        .max || 0
+    end
+
+    def consent_budget(consent)
+      consent.emergency_budget_minutes || @emergency_policies[consent.person_id]&.max_minutes || 0
+    end
+
+    def delegations_from(source_consent_id, from_supporter_id)
+      @delegations.select { |d| d.source_consent_id == source_consent_id && d.from_supporter_id == from_supporter_id }
+    end
+
+    # Budget already handed out by this sender from this source — cumulative
+    # across all sibling sub-delegations, so two sub-chains can over-allocate.
+    def allocated_emergency_budget(source_consent_id, from_supporter_id)
+      delegations_from(source_consent_id, from_supporter_id).sum { |d| d.emergency_budget_minutes || 0 }
+    end
+
+    def remaining_emergency_budget(source_consent_id, supporter_id, at: nil)
+      effective_emergency_budget(source_consent_id, supporter_id, at: at) -
+        allocated_emergency_budget(source_consent_id, supporter_id)
+    end
+
+    def delegatable_paths(source_consent_id, supporter_id, at: nil)
+      paths = delegation_paths(supporter_id).select do |p|
+        p[:root_consent] && p[:root_consent].id == source_consent_id && !p[:cycle]
+      end
+      paths = paths.select { |p| p[:delegations].all? { |d| d.active_at?(at) } } if at
+      paths
     end
 
     # All delegation chains from `supporter_id` upward toward a direct consent
@@ -205,8 +263,17 @@ module Domain
 
         world.emergencies_of(supporter_id).select { |e| e.scope == scope }.each do |ep|
           if ep.within_window?(at)
-            code = ep.reviewed? ? Reason::OK_EMERGENCY : Reason::OK_EMERGENCY_REVIEW_PENDING
-            return Decision.new(reason_code: code, authorized: true, chain: [emergency_link(ep, at)])
+            cap = emergency_budget_cap(world, supporter_id, at)
+            elapsed_minutes = (at - ep.started_at) / 60.0
+            if cap && elapsed_minutes > cap
+              denials << [Reason::DENY_EMERGENCY_BUDGET_EXCEEDED,
+                          [emergency_link(ep, at).merge("budgetCapMinutes" => cap)]]
+            else
+              code = ep.reviewed? ? Reason::OK_EMERGENCY : Reason::OK_EMERGENCY_REVIEW_PENDING
+              link = emergency_link(ep, at)
+              link["budgetCapMinutes"] = cap if cap
+              return Decision.new(reason_code: code, authorized: true, chain: [link])
+            end
           elsif ep.timed_out?(at)
             denials << [Reason::DENY_EMERGENCY_TIMEOUT, [emergency_link(ep, at)]]
           end
@@ -214,7 +281,43 @@ module Domain
 
         denials << [Reason::DENY_NO_CONSENT, []] if denials.empty?
         reason, chain = denials.min_by { |r, _| DENIAL_PRECEDENCE.index(r) }
-        Decision.new(reason_code: reason, authorized: false, chain: chain)
+        # Denial evidence never discloses scope contents: redacting the scope
+        # lists keeps the reason code and chain structure without revealing
+        # what the source consent (or any link) actually covers.
+        Decision.new(reason_code: reason, authorized: false, chain: redact_chain(chain))
+      end
+
+      # Budget cap (minutes) for emergency use, derived from live
+      # budget-bearing authority of the supporter. The budget is a minutes
+      # allowance on the person-level emergency policy, not tied to the
+      # delegated scopes — an emergency exception only matters when ordinary
+      # authority over the scope is absent. Dead sources/links grant nothing;
+      # with no positive live budget the policy alone applies (returns nil).
+      def emergency_budget_cap(world, supporter_id, at)
+        caps = []
+        world.consents_of(supporter_id).each do |c|
+          next unless c.active_at?(at) && !world.revoked?(c.id, at)
+
+          caps << world.consent_budget(c)
+        end
+        world.delegation_paths(supporter_id).each do |path|
+          root = path[:root_consent]
+          next if root.nil? || path[:cycle]
+          next unless !world.revoked?(root.id, at) && root.active_at?(at) &&
+                      path[:delegations].all? { |d| d.active_at?(at) }
+
+          caps << ([world.consent_budget(root)] + path[:delegations].map { |d| d.emergency_budget_minutes || 0 }).min
+        end
+        caps.select(&:positive?).max
+      end
+
+      def redact_chain(chain)
+        chain.map do |link|
+          redacted = link.dup
+          redacted["scopeCount"] = (link["scopes"]&.size || 0)
+          redacted.delete("scopes")
+          redacted
+        end
       end
 
       PATH_DENIAL = {
@@ -310,17 +413,26 @@ module Domain
   module Validate
     module_function
 
-    def consent(world:, person_id:, supporter_id:, scopes:, valid_from:, valid_to:, witness_id:)
+    def consent(world:, person_id:, supporter_id:, scopes:, valid_from:, valid_to:, witness_id:,
+                emergency_budget_minutes: nil)
       return "PERSON_UNKNOWN" unless world.persons.include?(person_id)
       return "SUPPORTER_UNKNOWN" unless world.supporters.include?(supporter_id)
       return "SCOPES_EMPTY" if scopes.nil? || scopes.empty?
       return "WITNESS_REQUIRED" if witness_id.nil? || witness_id.to_s.strip.empty?
       return "WINDOW_INVALID" unless valid_from < valid_to
 
+      if emergency_budget_minutes
+        return "CONSENT_BUDGET_INVALID" if emergency_budget_minutes.negative?
+
+        policy = world.emergency_policies[person_id]
+        return "CONSENT_BUDGET_EXCEEDS_POLICY" if policy && emergency_budget_minutes > policy.max_minutes
+      end
+
       nil
     end
 
-    def delegation(world:, source_consent_id:, from_supporter_id:, to_supporter_id:, scopes:, effective_from:, valid_to:)
+    def delegation(world:, source_consent_id:, from_supporter_id:, to_supporter_id:, scopes:,
+                   effective_from:, valid_to:, emergency_budget_minutes: nil)
       root = world.consent_by_id(source_consent_id)
       return "SOURCE_CONSENT_UNKNOWN" if root.nil?
       return "SUPPORTER_UNKNOWN" unless world.supporters.include?(to_supporter_id)
@@ -329,14 +441,26 @@ module Domain
 
       # The delegator must actually hold (directly or by delegation) every
       # scope they pass on: a delegation broader than its source never grants.
-      allowed = world.effective_delegatable_scopes(source_consent_id, from_supporter_id)
+      allowed = world.effective_delegatable_scopes(source_consent_id, from_supporter_id, at: effective_from)
       return "DELEGATION_NOT_HELD_BY_SENDER" if allowed.empty?
       return "DELEGATION_BROADER_THAN_SOURCE" unless (scopes - allowed).empty?
 
-      # Delegation after source expiry/revocation is rejected at write time.
+      # Source liveness is judged at the delegation's event time, not at
+      # wall-clock arrival: a late-arriving sub-chain whose effective_from
+      # precedes the revocation is still loggable, and decisions split by
+      # event time at evaluation.
       return "DELEGATION_SOURCE_REVOKED" if world.revoked?(root.id, effective_from)
       return "DELEGATION_SOURCE_EXPIRED" unless root.active_at?(effective_from)
-      return "DELEGATION_WINDOW_INVALID" if valid_to && (valid_to <= effective_from || valid_to > root.valid_to)
+
+      # Duration may never exceed the tightest window along the chain.
+      window_end = world.effective_delegatable_window(source_consent_id, from_supporter_id, at: effective_from)
+      return "DELEGATION_WINDOW_INVALID" if valid_to && (valid_to <= effective_from || (window_end && valid_to > window_end))
+
+      # Emergency budget may never exceed what remains of the source budget
+      # after every sibling sub-delegation already committed.
+      budget = emergency_budget_minutes || 0
+      return "DELEGATION_BUDGET_INVALID" if budget.negative?
+      return "DELEGATION_BUDGET_EXCEEDED" if budget > world.remaining_emergency_budget(source_consent_id, from_supporter_id, at: effective_from)
 
       nil
     end
@@ -355,6 +479,41 @@ module Domain
       return "EMERGENCY_SCOPE_NOT_ALLOWED" unless scope == policy.allowed_scope
 
       nil
+    end
+  end
+
+  # Builds stable, scope-redacted evidence chains for rejected sub-delegation
+  # attempts. The evidence proves WHY an attempt failed (root status, sender
+  # path, attempted link) without disclosing any scope contents.
+  module Evidence
+    module_function
+
+    def delegation_rejection(world:, source_consent_id:, from_supporter_id:, to_supporter_id:,
+                             attempted_id:, at:, reason:)
+      chain = []
+      root = world.consent_by_id(source_consent_id)
+      if root
+        status = if world.revoked?(root.id, at)
+                   "revoked"
+                 elsif root.active_at?(at)
+                   "active"
+                 else
+                   "expired"
+                 end
+        chain << Authorizer.consent_link(root, status, world.revocation_for(root.id))
+      end
+      path = world.delegation_paths(from_supporter_id).find do |p|
+        p[:root_consent] && p[:root_consent].id == source_consent_id && !p[:cycle]
+      end
+      (path ? path[:delegations] : []).reverse_each do |d|
+        chain << Authorizer.delegation_link(d, d.active_at?(at) ? "active" : "expired")
+      end
+      chain << {
+        "type" => "delegation", "id" => attempted_id, "sourceConsentId" => source_consent_id,
+        "fromSupporterId" => from_supporter_id, "toSupporterId" => to_supporter_id,
+        "status" => "rejected", "reason" => reason
+      }
+      Authorizer.redact_chain(chain)
     end
   end
 end
