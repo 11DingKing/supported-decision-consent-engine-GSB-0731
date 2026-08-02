@@ -37,7 +37,7 @@ module Consent
       append("SCOPE_DEFINED", { "scope" => scope }, event_time)
     end
 
-    def grant_consent(id:, supporter_id:, scopes:, from:, to:, witness_id:, event_time: nil)
+    def grant_consent(id:, supporter_id:, scopes:, from:, to:, witness_id:, emergency_budget_minutes: nil, event_time: nil)
       require_present!(id, "id")
       require_present!(supporter_id, "supporterId")
       raise ValidationError, "scopes must be a non-empty array" if !scopes.is_a?(Array) || scopes.empty?
@@ -48,7 +48,8 @@ module Consent
         "scopes" => scopes,
         "from" => normalize_time(from),
         "to" => normalize_time(to),
-        "witnessId" => witness_id
+        "witnessId" => witness_id,
+        "emergencyBudgetMinutes" => emergency_budget_minutes
       }
       append("CONSENT_GRANTED", payload, event_time || from)
     end
@@ -59,7 +60,7 @@ module Consent
       append("CONSENT_REVOKED", { "consentId" => consent_id, "at" => normalize_time(at) }, event_time || at)
     end
 
-    def create_delegation(id:, source_consent_id:, from_supporter_id:, to_supporter_id:, scopes:, from: nil, to: nil, event_time: nil)
+    def create_delegation(id:, source_consent_id:, from_supporter_id:, to_supporter_id:, scopes:, from: nil, to: nil, budget_minutes: nil, event_time: nil)
       require_present!(id, "id")
       require_present!(source_consent_id, "sourceConsentId")
       require_present!(from_supporter_id, "fromSupporterId")
@@ -73,7 +74,8 @@ module Consent
         "toSupporterId" => to_supporter_id,
         "scopes" => scopes,
         "from" => normalize_time(from),
-        "to" => normalize_time(to)
+        "to" => normalize_time(to),
+        "budgetMinutes" => budget_minutes
       }
       append("DELEGATION_CREATED", payload, event_time || from)
     end

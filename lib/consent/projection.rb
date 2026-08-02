@@ -16,13 +16,13 @@ module Consent
 
   Consent_ = Struct.new(
     :id, :supporter_id, :scopes, :from, :to, :witness_id,
-    :revoked_at, :granted_seq,
+    :revoked_at, :granted_seq, :emergency_budget_minutes,
     keyword_init: true
   )
 
   Delegation = Struct.new(
     :id, :source_consent_id, :from_supporter_id, :to_supporter_id,
-    :scopes, :from, :to, :revoked_at, :created_seq,
+    :scopes, :from, :to, :revoked_at, :created_seq, :budget_minutes,
     keyword_init: true
   )
 
@@ -95,7 +95,8 @@ module Consent
           to: Instant.parse(p["to"]),
           witness_id: p["witnessId"],
           revoked_at: nil,
-          granted_seq: event.seq
+          granted_seq: event.seq,
+          emergency_budget_minutes: p["emergencyBudgetMinutes"]
         )
       when "CONSENT_REVOKED"
         c = @consents[event.payload["consentId"]]
@@ -116,7 +117,8 @@ module Consent
           from: Instant.parse(p["from"]),
           to: Instant.parse(p["to"]),
           revoked_at: nil,
-          created_seq: event.seq
+          created_seq: event.seq,
+          budget_minutes: p["budgetMinutes"]
         )
       when "DELEGATION_REVOKED"
         d = @delegations[event.payload["delegationId"]]

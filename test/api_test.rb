@@ -88,4 +88,30 @@ class ApiTest < Minitest::Test
     assert_equal before + 1, after
     assert_equal "DECISION_REQUESTED", JSON.parse(last_response.body)["events"].last["type"]
   end
+
+  def test_sub_delegation_budget_cap_over_http_returns_redacted_evidence
+    # A sub-delegation whose emergency budget exceeds the source is denied, and
+    # the API surfaces scope-redacted evidence — no scope leakage over the wire.
+    post_json("/supporters", { "supporterId" => "SUPPORTER-BUD" })
+    post_json("/consents",
+      { "id" => "CONSENT-BUD", "supporterId" => "SUPPORTER-A",
+        "scopes" => ["LEGAL_AID_APPLICATION"], "from" => "2026-08-01T00:00:00Z",
+        "to" => "2026-12-01T00:00:00Z", "witnessId" => "W-1",
+        "emergencyBudgetMinutes" => 30 })
+    post_json("/delegations",
+      { "id" => "DELEG-BIG", "sourceConsentId" => "CONSENT-BUD",
+        "fromSupporterId" => "SUPPORTER-A", "toSupporterId" => "SUPPORTER-BUD",
+        "scopes" => ["LEGAL_AID_APPLICATION"], "budgetMinutes" => 90 })
+    body = post_json("/decisions",
+      { "supporterId" => "SUPPORTER-BUD", "scope" => "LEGAL_AID_APPLICATION",
+        "at" => "2026-09-01T00:00:00Z", "record" => false })
+    assert_equal false, body["authorized"]
+    assert_equal "DELEGATION_BUDGET_EXCEEDS_SOURCE", body["reasonCode"]
+    refute_empty body["authorityChain"]
+    body["authorityChain"].each do |link|
+      refute link.key?("scopes")
+      refute link.key?("scope")
+      assert_equal true, link["scopesRedacted"]
+    end
+  end
 end

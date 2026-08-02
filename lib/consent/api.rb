@@ -81,7 +81,8 @@ module Consent
       b = json_body
       created(ledger.grant_consent(
         id: b["id"], supporter_id: b["supporterId"], scopes: b["scopes"],
-        from: b["from"], to: b["to"], witness_id: b["witnessId"]
+        from: b["from"], to: b["to"], witness_id: b["witnessId"],
+        emergency_budget_minutes: b["emergencyBudgetMinutes"]
       ))
     end
 
@@ -95,7 +96,8 @@ module Consent
       created(ledger.create_delegation(
         id: b["id"], source_consent_id: b["sourceConsentId"],
         from_supporter_id: b["fromSupporterId"], to_supporter_id: b["toSupporterId"],
-        scopes: b["scopes"], from: b["from"], to: b["to"]
+        scopes: b["scopes"], from: b["from"], to: b["to"],
+        budget_minutes: b["budgetMinutes"]
       ))
     end
 

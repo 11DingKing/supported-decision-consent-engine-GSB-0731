@@ -103,6 +103,9 @@ See [THREAT_MODEL.md](THREAT_MODEL.md) for the full mapping. Summary:
   precedence over expiry, replay before the revocation seq.
 - **Delegation / re-delegation** — `test/delegation_test.rb`: multi-level chains,
   scope-exceeds-source, source expiry/revocation collapse, cycle detection.
+- **Concurrent sub-delegation** — `test/sub_delegation_test.rb`: scope/duration/
+  budget caps against the source, cumulative sibling-budget accounting,
+  revoke-before-save + delayed-arrival race, scope-redacted denial evidence.
 - **Emergency** — `test/emergency_test.rb`: timeout hard-expiry, scope restriction,
   mandated-review-missing denial, non-delegatable, fallback-only ordering.
 - **Races / history** — `test/determinism_test.rb`: replay stability, pinned

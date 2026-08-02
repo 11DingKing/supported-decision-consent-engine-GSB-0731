@@ -80,6 +80,68 @@ a delegation **cycle** manufactures authority from nothing (A→B→A).
 
 ---
 
+## 2a. Concurrent sub-delegation from one source authority (round 2)
+
+**Threat.** Two supporters receive sub-delegations that draw on the **same
+source consent**. Individually each looks fine, but together they let the
+supporters wield more authority than the source ever held — via a wider scope,
+a longer window, an oversized emergency budget, or two budgets that each fit
+but **cumulatively** exceed the source. The race sharpens it: one
+sub-delegation is revoked before its branch is persisted while another arrives
+late, so a naive engine double-counts (or loses track of) the shared budget and
+silently widens scope. A denial must also not leak *which* scopes the person
+holds.
+
+**Defence.** A sub-delegation may never grant more than its source. In addition
+to scope containment (§2), three caps are checked as-of `(eventTime, asOfSeq)`
+in `Engine#cap_violation`:
+
+- **Duration** — a declared sub-window reaching outside the source's effective
+  window (`Engine#duration_exceeds_source?`) →
+  `DELEGATION_DURATION_EXCEEDS_SOURCE`. A `nil` bound inherits the source's,
+  because the source authority is itself re-validated at `at`.
+- **Per-link budget** — a delegated emergency-exception budget above the source
+  consent's `emergencyBudgetMinutes` (or any budget when the source has none) →
+  `DELEGATION_BUDGET_EXCEEDS_SOURCE`.
+- **Cumulative sibling budget** — sub-delegations on the same source consent
+  share ONE budget, summed greedily in `created_seq` order over the siblings
+  **valid as-of `at`** (`Engine#cumulative_budget_exceeded?`). The sibling that
+  pushes the running total over the source budget →
+  `DELEGATION_BUDGET_EXCEEDED`.
+
+The race resolves deterministically because validity is a pure function of the
+anchors: a **revoked** sibling is not valid at `at`, so it frees its share; a
+**late-arriving** sibling has a higher `seq`, so it is invisible to a decision
+pinned below it and cannot retroactively consume budget. Every denied sub-chain
+still returns authority-chain **evidence with scopes redacted**
+(`Engine#redact`, `"scopesRedacted": true`), so an auditor sees *where* the
+chain broke without learning the held scopes.
+
+Reuses round-1 identifiers (`CONSENT-1`, `SUPPORTER-A/B/C`, `DELEG-OK`,
+`DELEG-BROAD`, the three scopes, witness `W-1`) and the audit-seq ordering.
+
+**Test evidence — `test/sub_delegation_test.rb`**
+
+| Test | Asserts |
+|---|---|
+| `test_deleg_ok_still_authorizes_with_caps_in_place` | round-1 `DELEG-OK` still authorizes |
+| `test_deleg_broad_denied_with_redacted_evidence` | `DELEGATION_SCOPE_EXCEEDS_SOURCE`, evidence scope-redacted |
+| `test_sub_delegation_window_within_source_authorizes` | in-window sub authorizes |
+| `test_sub_delegation_window_exceeds_source_denied` | `DELEGATION_DURATION_EXCEEDS_SOURCE` |
+| `test_sub_delegation_budget_within_source_authorizes` | 20 ≤ 30 authorizes |
+| `test_sub_delegation_budget_exceeds_source_denied` | `DELEGATION_BUDGET_EXCEEDS_SOURCE` (45 > 30) |
+| `test_two_sub_chains_individually_fit_but_cumulatively_exceed` | 20+20 > 30 → second is `DELEGATION_BUDGET_EXCEEDED` |
+| `test_revoked_sibling_frees_cumulative_budget` | revoke-before-save + delayed arrival: revoked sibling frees its budget |
+| `test_before_revocation_seq_both_original_siblings_accounted` | pinned `asOfSeq` reproduces the historical cumulative answer |
+| `test_delayed_sibling_not_visible_below_its_seq` | late sibling cannot retroactively consume budget |
+| `test_invalid_source_denies_all_siblings_without_leaking_scope` | dead source → `SOURCE_CONSENT_INVALID`, redacted |
+| `test_cumulative_cycle_still_detected` | budgets on a cyclic sub-chain still `DELEGATION_CYCLE` |
+| `test_concurrent_sibling_submission_never_exceeds_source_budget` | concurrent creates+revoke+decisions: replay-stable, cumulative authorized budget never exceeds source |
+
+Also verified over HTTP (`test/api_test.rb#test_sub_delegation_budget_cap_over_http_returns_redacted_evidence`) and against the live server: the cumulative overflow denies with redacted evidence, and revoking the first sibling re-authorizes the second.
+
+---
+
 ## 3. Emergency exception
 
 **Threat.** A time-boxed emergency override outlives its window (timeout
@@ -175,7 +237,9 @@ Authorized: `AUTHORIZED_DIRECT_CONSENT`, `AUTHORIZED_DELEGATED_CONSENT`,
 
 Denied (most-specific first): `DELEGATION_CYCLE`, `CONSENT_REVOKED`,
 `DELEGATION_REVOKED`, `SOURCE_CONSENT_INVALID`,
-`DELEGATION_SCOPE_EXCEEDS_SOURCE`, `DELEGATION_SOURCE_AUTHORITY_MISSING`,
+`DELEGATION_SCOPE_EXCEEDS_SOURCE`, `DELEGATION_DURATION_EXCEEDS_SOURCE`,
+`DELEGATION_BUDGET_EXCEEDS_SOURCE`, `DELEGATION_BUDGET_EXCEEDED`,
+`DELEGATION_SOURCE_AUTHORITY_MISSING`,
 `CONSENT_EXPIRED`, `DELEGATION_EXPIRED`, `EMERGENCY_EXPIRED`,
 `EMERGENCY_REVIEW_MISSING`, `EMERGENCY_SCOPE_NOT_ALLOWED`,
 `CONSENT_NOT_WITNESSED`, `CONSENT_NOT_YET_EFFECTIVE`,

@@ -123,11 +123,33 @@ module Consent
     end
 
     # Validate a delegation link and its source authority as-of `at`.
+    #
+    # A sub-delegation may never grant MORE than the source authority it draws
+    # on. Beyond scope containment (enforced by requiring the source to itself
+    # hold `scope`), three caps are checked, all as-of (event_time, as_of_seq):
+    #   * duration  — the sub-delegation window must sit inside the source's
+    #                 effective window (a nil bound inherits the source's).
+    #   * budget    — a delegated emergency-exception budget cannot exceed the
+    #                 source consent's budget.
+    #   * cumulative sibling budget — sub-delegations drawing on the same source
+    #                 consent share one budget; summed greedily in created_seq
+    #                 order over the siblings VALID at `at`, the one that pushes
+    #                 the total over the source budget is denied. A revoked or
+    #                 not-yet-arrived (higher-seq) sibling neither holds nor
+    #                 frees budget it doesn't have, which is what makes the
+    #                 revoke-before-save / delayed-arrival race resolve stably.
+    #
+    # Every denial still returns authority-chain EVIDENCE, but with scope fields
+    # redacted, so an auditor sees WHERE the chain broke without learning WHICH
+    # scopes the person holds.
     def evaluate_delegation(deleg, scope, at, visited)
       from = deleg.from_supporter_id
 
       # Cycle: the source supporter is already on our resolution path.
-      return [Outcome.new(code: ReasonCodes::DELEGATION_CYCLE, chain: [])] if visited.include?(from)
+      if visited.include?(from)
+        return [Outcome.new(code: ReasonCodes::DELEGATION_CYCLE,
+                            chain: redact([delegation_link(deleg)]))]
+      end
 
       results = []
       del_code = delegation_validity(deleg, at)
@@ -135,26 +157,91 @@ module Consent
       source_ok = source_candidates.find(&:authorized?)
 
       if source_ok
-        results << if del_code == :ok
-          Outcome.new(
-            code: ReasonCodes::AUTHORIZED_DELEGATED_CONSENT,
-            chain: source_ok.chain + [delegation_link(deleg)]
-          )
-        else
+        attempted = source_ok.chain + [delegation_link(deleg)]
+
+        if del_code != :ok
           # Source is fine but this delegation link is itself invalid.
-          Outcome.new(code: del_code, chain: [])
+          results << Outcome.new(code: del_code, chain: redact(attempted))
+        elsif (cap = cap_violation(deleg, source_ok.chain, at))
+          results << Outcome.new(code: cap, chain: redact(attempted))
+        else
+          results << Outcome.new(code: ReasonCodes::AUTHORIZED_DELEGATED_CONSENT, chain: attempted)
         end
       else
         # Source authority is absent. Translate the upstream failure into a
         # delegation-boundary reason so the caller learns WHY the chain broke.
-        src_code = ReasonCodes.most_specific_denial(source_candidates.map(&:code))
-        results << Outcome.new(code: translate_source_failure(src_code), chain: [])
+        # Carry redacted evidence of the attempted (broken) link.
+        src_best = source_candidates.min_by do |o|
+          idx = ReasonCodes::DENIAL_PRECEDENCE.index(o.code)
+          idx || ReasonCodes::DENIAL_PRECEDENCE.length
+        end
+        evidence = redact((src_best&.chain || []) + [delegation_link(deleg)])
+        results << Outcome.new(code: translate_source_failure(src_best&.code), chain: evidence)
         # Also surface a broken delegation link if it independently failed, so
         # precedence can pick the most specific overall.
-        results << Outcome.new(code: del_code, chain: []) unless del_code == :ok
+        results << Outcome.new(code: del_code, chain: evidence) unless del_code == :ok
       end
 
       results
+    end
+
+    # Returns the most specific cap-violation reason code for this sub-delegation
+    # against its source authority, or nil if within every cap.
+    def cap_violation(deleg, source_chain, at)
+      return ReasonCodes::DELEGATION_DURATION_EXCEEDS_SOURCE if duration_exceeds_source?(deleg, source_chain)
+
+      source_consent = @projection.consents[deleg.source_consent_id]
+      source_budget = source_consent&.emergency_budget_minutes
+
+      if deleg.budget_minutes
+        # Cannot delegate a budget the source never had, nor more than it holds.
+        return ReasonCodes::DELEGATION_BUDGET_EXCEEDS_SOURCE if source_budget.nil?
+        return ReasonCodes::DELEGATION_BUDGET_EXCEEDS_SOURCE if deleg.budget_minutes > source_budget
+        return ReasonCodes::DELEGATION_BUDGET_EXCEEDED if cumulative_budget_exceeded?(deleg, source_budget, at)
+      end
+
+      nil
+    end
+
+    # A nil bound on the sub-delegation inherits the source's bound — inheritance
+    # is enforced dynamically, because the source authority is itself
+    # re-validated as-of `at`, so an unbounded sub-delegation can never actually
+    # be exercised outside the (live) source window. The cap therefore fires
+    # only when the sub-delegation DECLARES a window that reaches strictly
+    # outside the source's effective window.
+    def duration_exceeds_source?(deleg, source_chain)
+      src_from, src_to = chain_window(source_chain)
+      return true if deleg.from && src_from && deleg.from < src_from
+      return true if deleg.to && src_to && deleg.to > src_to
+
+      false
+    end
+
+    # Effective window of an authority chain = intersection of all link windows
+    # (latest start, earliest end). Nil bounds are treated as unbounded.
+    def chain_window(chain)
+      froms = chain.filter_map { |l| l["from"] && Instant.parse(l["from"]) }
+      tos   = chain.filter_map { |l| l["to"] && Instant.parse(l["to"]) }
+      [froms.max, tos.min]
+    end
+
+    # Greedy cumulative accounting over sibling sub-delegations that draw on the
+    # same source consent, are VALID as-of `at`, and carry a budget. Siblings
+    # claim budget in created_seq order; `deleg` is denied if the running total
+    # up to and including it overflows the shared source budget.
+    def cumulative_budget_exceeded?(deleg, source_budget, at)
+      siblings = @projection.delegations.values.select do |d|
+        d.source_consent_id == deleg.source_consent_id &&
+          d.budget_minutes &&
+          delegation_validity(d, at) == :ok
+      end.sort_by(&:created_seq)
+
+      running = 0
+      siblings.each do |d|
+        running += d.budget_minutes
+        return running > source_budget if d.id == deleg.id
+      end
+      false
     end
 
     # A source failure, seen from the delegation boundary. A source that never
@@ -253,8 +340,14 @@ module Consent
     end
 
     def denial_outcome(candidates)
-      code = ReasonCodes.most_specific_denial(candidates.map(&:code))
-      Outcome.new(code: code, chain: [])
+      denials = candidates.reject(&:authorized?)
+      code = ReasonCodes.most_specific_denial(denials.map(&:code))
+      # Attach the evidence chain of the winning denial (already scope-redacted
+      # for any delegation path), so an auditor sees WHERE it broke — never the
+      # scopes involved. Prefer a candidate that carries evidence.
+      winning = denials.select { |o| o.code == code }
+      best = winning.max_by { |o| o.chain.length } || winning.first
+      Outcome.new(code: code, chain: best&.chain || [])
     end
 
     def consent_link(consent)
@@ -276,7 +369,10 @@ module Consent
         "sourceConsentId" => deleg.source_consent_id,
         "fromSupporterId" => deleg.from_supporter_id,
         "toSupporterId" => deleg.to_supporter_id,
-        "scopes" => deleg.scopes
+        "scopes" => deleg.scopes,
+        "from" => deleg.from&.iso8601,
+        "to" => deleg.to&.iso8601,
+        "budgetMinutes" => deleg.budget_minutes
       }
     end
 
@@ -289,6 +385,19 @@ module Consent
         "invokedAt" => emergency.invoked_at&.iso8601,
         "maxMinutes" => emergency.max_minutes
       }
+    end
+
+    # Strip every scope-bearing field from an authority chain so a DENIED
+    # decision leaks no information about which scopes the person or their
+    # supporters actually hold. Structural links (who delegated to whom, which
+    # consent/delegation ids, windows, budgets) are preserved as evidence, and a
+    # `scopesRedacted` flag marks that redaction occurred.
+    def redact(chain)
+      chain.map do |link|
+        redacted = link.reject { |k, _| k == "scopes" || k == "scope" }
+        redacted["scopesRedacted"] = true
+        redacted
+      end
     end
 
     def blank?(value)
