@@ -42,6 +42,7 @@ class Store
 
       CREATE TABLE IF NOT EXISTS decisions (
         id         TEXT PRIMARY KEY,
+        request_id TEXT,
         person_id  TEXT NOT NULL,
         supporter_id TEXT NOT NULL,
         scope      TEXT NOT NULL,
@@ -57,6 +58,13 @@ class Store
       CREATE TRIGGER IF NOT EXISTS decisions_no_delete BEFORE DELETE ON decisions
       BEGIN SELECT RAISE(ABORT, 'decisions are immutable'); END;
     SQL
+    # Upgrade path for databases created before request_id existed.
+    begin
+      @db.execute("ALTER TABLE decisions ADD COLUMN request_id TEXT")
+    rescue SQLite3::SQLException
+      nil
+    end
+    @db.execute("CREATE UNIQUE INDEX IF NOT EXISTS decisions_request_id ON decisions(request_id)")
   end
 
   # Run a block inside an IMMEDIATE transaction. The block receives the
@@ -84,7 +92,7 @@ class Store
   def append_event(type:, payload:, event_time:)
     @db.execute(
       "INSERT INTO events (type, payload, event_time, recorded_at) VALUES (?, ?, ?, ?)",
-      [type, JSON.generate(payload), event_time.utc.iso8601, Time.now.utc.iso8601]
+      [type, JSON.generate(payload), Domain.iso8601(event_time), Time.now.utc.iso8601]
     )
     @db.last_insert_row_id
   end
@@ -105,30 +113,43 @@ class Store
 
   # Evaluate-and-record atomically: snapshot seq, evaluate, journal the
   # decision against exactly that seq, all inside one IMMEDIATE transaction.
-  def evaluate_and_record(person_id:, supporter_id:, scope:, at:)
+  # With a request_id the submission is idempotent: a duplicate delivery
+  # returns the originally journaled verdict unchanged — resubmission can
+  # never widen scope, move the audit boundary, or reset a budget.
+  def evaluate_and_record(person_id:, supporter_id:, scope:, at:, request_id: nil)
     in_transaction do |seq|
+      if request_id
+        existing = fetch_decision_by_request(request_id)
+        next existing.merge("duplicate" => true) if existing
+      end
       snapshot = world(as_of_seq: seq)
       decision = Domain::Authorizer.evaluate(world: snapshot, supporter_id: supporter_id, scope: scope, at: at)
       id = "DEC-#{SecureRandom.uuid}"
       @db.execute(
-        "INSERT INTO decisions (id, person_id, supporter_id, scope, event_time, as_of_seq, reason_code, authorized, chain, recorded_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [id, person_id, supporter_id, scope, at.utc.iso8601, seq,
+        "INSERT INTO decisions (id, request_id, person_id, supporter_id, scope, event_time, as_of_seq, reason_code, authorized, chain, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [id, request_id, person_id, supporter_id, scope, Domain.iso8601(at), seq,
          decision.reason_code, decision.authorized ? 1 : 0,
          JSON.generate(decision.chain), Time.now.utc.iso8601]
       )
-      { "decisionId" => id, "personId" => person_id, "supporterId" => supporter_id,
-        "scope" => scope, "at" => at.utc.iso8601, "asOfSeq" => seq,
+      { "decisionId" => id, "requestId" => request_id, "duplicate" => false,
+        "personId" => person_id, "supporterId" => supporter_id,
+        "scope" => scope, "at" => Domain.iso8601(at), "asOfSeq" => seq,
         "reasonCode" => decision.reason_code, "authorized" => decision.authorized,
         "chain" => decision.chain }
     end
+  end
+
+  def fetch_decision_by_request(request_id)
+    row = @db.get_first_row("SELECT id FROM decisions WHERE request_id = ?", [request_id])
+    row && fetch_decision(row["id"])
   end
 
   def fetch_decision(id)
     row = @db.get_first_row("SELECT * FROM decisions WHERE id = ?", [id])
     return nil if row.nil?
 
-    { "decisionId" => row["id"], "personId" => row["person_id"],
+    { "decisionId" => row["id"], "requestId" => row["request_id"], "personId" => row["person_id"],
       "supporterId" => row["supporter_id"], "scope" => row["scope"],
       "at" => row["event_time"], "asOfSeq" => row["as_of_seq"].to_i,
       "reasonCode" => row["reason_code"], "authorized" => row["authorized"] == 1,

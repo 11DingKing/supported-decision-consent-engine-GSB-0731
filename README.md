@@ -25,10 +25,20 @@ and SQLite persistence orchestrate and store; they never judge.
 ## Boundary semantics (deterministic)
 
 - Consent validity is half-open `[from, to)`: active at `from`, expired at `to`.
-- Revocation wins ties: a decision exactly at the revocation instant is
-  revoked (fail-closed). One second earlier is still authorized.
+- Revocation wins ties at **microsecond** resolution: a decision exactly at
+  the revocation instant is revoked (fail-closed); one microsecond earlier is
+  authorized, one microsecond later is revoked. Event times are persisted
+  with microsecond fidelity so the boundary survives the DB round-trip.
+- The first revocation logged wins; a later attempt to backdate an earlier
+  revocation instant is rejected (`ALREADY_REVOKED`) and never rewrites history.
 - Emergency window is inclusive: valid exactly at `started_at + maxMinutes`,
-  timed out one second later.
+  timed out one second later. The budget cap is pinned to the episode's
+  `startedAt` — revocation mid-episode neither resets nor expands it.
+- `POST /decisions/evaluate` accepts an optional `requestId`: resubmitting
+  the same `requestId` returns the originally journaled verdict
+  (`duplicate: true`, same `decisionId`, same `asOfSeq`). Duplicates can
+  never widen scope, move the audit boundary, or reset a budget; a new
+  `requestId` deliberately re-queries the current snapshot.
 - Denials use a fixed precedence list (`DENIAL_PRECEDENCE`), so competing
   denial reasons always resolve to the same stable reason code.
 
@@ -179,11 +189,37 @@ reason codes, ids, statuses and `scopeCount`, but never scope contents.
   `test_denial_chain_redacts_scopes_but_keeps_structure`,
   `test_rejection_evidence_is_stable_and_redacted`.
 
+**Revocation races (round 3)**
+
+- _In-flight decision at the exact instant_: fail-closed at microsecond
+  resolution — exact instant denied, −1µs authorized, +1µs denied, in the
+  pure domain and after DB round-trip; a revocation instant with fractional
+  seconds is honored verbatim. Evidence: `test_three_outcomes_pure_domain`,
+  `test_three_outcomes_survive_persistence_and_replay`,
+  `test_microsecond_revocation_instant_itself`.
+- _Out-of-order revocation events_: first logged wins; backdating attempts
+  are rejected and the effective instant never moves. Evidence:
+  `test_out_of_order_revocation_events_first_logged_wins`.
+- _Duplicate decision submissions_: idempotent per `requestId`; a duplicate
+  returns the pinned verdict even after late facts make the same event time
+  authorizable — resubmission cannot expand scope. Evidence:
+  `test_duplicate_submission_returns_pinned_verdict`,
+  `test_duplicate_submission_cannot_expand_scope`.
+- _Budget burned, then revoked_: the emergency cap is pinned to the episode
+  start, so a mid-episode revocation neither resets the budget to the policy
+  window nor expands it, and re-submitting the evaluation cannot reset it
+  either. Evidence: `test_emergency_budget_pinned_at_episode_start_across_revocation`.
+- _Concurrent REVOKE-1 vs. in-flight decisions_: at −1µs all decisions
+  authorize regardless of the race; at/after the instant a verdict is
+  authorized only from a snapshot predating the revocation's seq, and every
+  verdict replays identically with the same `asOfSeq`. Evidence:
+  `test_concurrent_revoke_vs_inflight_decisions`.
+
 ## Native verification
 
 ```sh
 bundle install
-bundle exec rake test     # 71 runs, 436 assertions
+bundle exec rake test     # 79 runs, 539 assertions
 bundle exec ruby app.rb   # serves on :4567, seeds materials/consent-cases.json
 ```
 

@@ -109,7 +109,7 @@ post "/persons/:person_id/consents" do
       STORE.append_event(type: "CONSENT_GRANTED",
                          payload: { "id" => id, "personId" => params[:person_id],
                                     "supporterId" => body["supporterId"], "scopes" => body["scopes"],
-                                    "from" => valid_from.utc.iso8601, "to" => valid_to.utc.iso8601,
+                                    "from" => Domain.iso8601(valid_from), "to" => Domain.iso8601(valid_to),
                                     "witnessId" => body["witnessId"],
                                     "emergencyBudgetMinutes" => body["emergencyBudgetMinutes"] },
                          event_time: valid_from)
@@ -132,12 +132,12 @@ post "/consents/:consent_id/revoke" do
       err = Domain::Validate.revocation(world: STORE.world(as_of_seq: s), consent_id: params[:consent_id])
       domain_error(err) if err
       STORE.append_event(type: "CONSENT_REVOKED",
-                         payload: { "id" => id, "consentId" => params[:consent_id], "at" => at.utc.iso8601 },
+                         payload: { "id" => id, "consentId" => params[:consent_id], "at" => Domain.iso8601(at) },
                          event_time: at)
     end
   end
   status 201
-  { revocationId: id, consentId: params[:consent_id], at: at.utc.iso8601, seq: seq }.to_json
+  { revocationId: id, consentId: params[:consent_id], at: Domain.iso8601(at), seq: seq }.to_json
 end
 
 post "/consents/:consent_id/delegations" do
@@ -183,8 +183,8 @@ post "/consents/:consent_id/delegations" do
                                       "fromSupporterId" => from_supporter,
                                       "toSupporterId" => body["toSupporterId"],
                                       "scopes" => body["scopes"],
-                                      "effectiveFrom" => effective_from.utc.iso8601,
-                                      "to" => valid_to&.utc&.iso8601,
+                                      "effectiveFrom" => Domain.iso8601(effective_from),
+                                      "to" => valid_to && Domain.iso8601(valid_to),
                                       "emergencyBudgetMinutes" => body["emergencyBudgetMinutes"] },
                            event_time: effective_from)
       end
@@ -210,7 +210,7 @@ post "/persons/:person_id/emergencies" do
       STORE.append_event(type: "EMERGENCY_STARTED",
                          payload: { "id" => id, "personId" => params[:person_id],
                                     "supporterId" => body["supporterId"], "scope" => body["scope"],
-                                    "startedAt" => at.utc.iso8601, "maxMinutes" => policy.max_minutes },
+                                    "startedAt" => Domain.iso8601(at), "maxMinutes" => policy.max_minutes },
                          event_time: at)
     end
   end
@@ -225,7 +225,7 @@ post "/emergencies/:emergency_id/review" do
     STORE.in_transaction do
       STORE.append_event(type: "EMERGENCY_REVIEWED",
                          payload: { "emergencyId" => params[:emergency_id],
-                                    "reviewerId" => body["reviewerId"], "at" => at.utc.iso8601 },
+                                    "reviewerId" => body["reviewerId"], "at" => Domain.iso8601(at) },
                          event_time: at)
     end
   end
@@ -235,13 +235,15 @@ end
 
 # The decision endpoint pins both the event time and the audit sequence it
 # observed; the verdict is journaled and can be replayed deterministically.
+# Supplying a requestId makes the submission idempotent: a duplicate delivery
+# returns the originally journaled verdict instead of re-evaluating.
 post "/decisions/evaluate" do
   body = json_body
   at = parse_time(body["at"], "at")
   halt 400, { error: "SCOPE_REQUIRED" }.to_json if body["scope"].to_s.empty?
   result = synchronized do
     STORE.evaluate_and_record(person_id: body["personId"], supporter_id: body["supporterId"],
-                              scope: body["scope"], at: at)
+                              scope: body["scope"], at: at, request_id: body["requestId"])
   end
   status 200
   result.to_json
@@ -308,7 +310,7 @@ def seed_from_materials!
       STORE.append_event(type: "DELEGATION_CREATED",
                          payload: { "id" => d["id"], "sourceConsentId" => d["sourceConsentId"],
                                     "fromSupporterId" => d["fromSupporterId"], "toSupporterId" => d["toSupporterId"],
-                                    "scopes" => d["scopes"], "effectiveFrom" => effective_from.utc.iso8601,
+                                    "scopes" => d["scopes"], "effectiveFrom" => Domain.iso8601(effective_from),
                                     "to" => d["to"] },
                          event_time: effective_from)
     end

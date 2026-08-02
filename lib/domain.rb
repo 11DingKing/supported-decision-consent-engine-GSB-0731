@@ -10,6 +10,14 @@ require "time"
 # Replaying with the same (sequence, event time) always yields the same
 # reason code and authorization chain.
 module Domain
+  # ISO8601 serialization that preserves microsecond precision when present:
+  # revocation boundaries are defined at microsecond resolution, so dropping
+  # sub-second parts through the DB round-trip would silently move them.
+  def self.iso8601(t)
+    t = t.utc
+    t.subsec.zero? ? t.iso8601 : t.iso8601(6)
+  end
+
   module Reason
     OK_DIRECT                    = "OK_DIRECT"
     OK_DELEGATED                 = "OK_DELEGATED"
@@ -263,15 +271,23 @@ module Domain
 
         world.emergencies_of(supporter_id).select { |e| e.scope == scope }.each do |ep|
           if ep.within_window?(at)
-            cap = emergency_budget_cap(world, supporter_id, at)
+            # The budget cap is pinned to the episode's start: the chain is
+            # evaluated as of started_at, so a revocation mid-episode neither
+            # expands the budget (no fallback to the policy window) nor
+            # resets it. Resubmitting the same evaluation cannot change it.
+            cap = emergency_budget_cap(world, supporter_id, ep.started_at)
             elapsed_minutes = (at - ep.started_at) / 60.0
             if cap && elapsed_minutes > cap
               denials << [Reason::DENY_EMERGENCY_BUDGET_EXCEEDED,
-                          [emergency_link(ep, at).merge("budgetCapMinutes" => cap)]]
+                          [emergency_link(ep, at).merge("budgetCapMinutes" => cap,
+                                                         "budgetPinnedAt" => Domain.iso8601(ep.started_at))]]
             else
               code = ep.reviewed? ? Reason::OK_EMERGENCY : Reason::OK_EMERGENCY_REVIEW_PENDING
               link = emergency_link(ep, at)
-              link["budgetCapMinutes"] = cap if cap
+              if cap
+                link["budgetCapMinutes"] = cap
+                link["budgetPinnedAt"] = Domain.iso8601(ep.started_at)
+              end
               return Decision.new(reason_code: code, authorized: true, chain: [link])
             end
           elsif ep.timed_out?(at)
@@ -375,11 +391,12 @@ module Domain
       def consent_link(c, status, revocation = nil)
         h = {
           "type" => "consent", "id" => c.id, "personId" => c.person_id,
-          "supporterId" => c.supporter_id, "scopes" => c.scopes,
-          "from" => c.valid_from.utc.iso8601, "to" => c.valid_to.utc.iso8601,
+          "supporterId" => c.supporter_id,
+          "from" => Domain.iso8601(c.valid_from), "to" => Domain.iso8601(c.valid_to),
           "witnessId" => c.witness_id, "status" => status
         }
-        h["revokedAt"] = revocation.at.utc.iso8601 if revocation
+        h["revokedAt"] = Domain.iso8601(revocation.at) if revocation
+        h["scopes"] = c.scopes
         h
       end
 
@@ -389,8 +406,8 @@ module Domain
           "sourceConsentId" => d.source_consent_id,
           "fromSupporterId" => d.from_supporter_id, "toSupporterId" => d.to_supporter_id,
           "scopes" => d.scopes,
-          "effectiveFrom" => d.effective_from.utc.iso8601,
-          "to" => d.valid_to&.utc&.iso8601,
+          "effectiveFrom" => Domain.iso8601(d.effective_from),
+          "to" => d.valid_to && Domain.iso8601(d.valid_to),
           "createdSeq" => d.created_seq, "status" => status
         }
       end
@@ -399,9 +416,9 @@ module Domain
         {
           "type" => "emergency", "id" => ep.id, "supporterId" => ep.supporter_id,
           "scope" => ep.scope,
-          "startedAt" => ep.started_at.utc.iso8601,
-          "windowEnd" => ep.window_end.utc.iso8601,
-          "reviewedAt" => ep.reviewed_at&.utc&.iso8601,
+          "startedAt" => Domain.iso8601(ep.started_at),
+          "windowEnd" => Domain.iso8601(ep.window_end),
+          "reviewedAt" => ep.reviewed_at && Domain.iso8601(ep.reviewed_at),
           "status" => ep.within_window?(at) ? (ep.reviewed? ? "within_window_reviewed" : "within_window_review_pending") : "timeout"
         }
       end
