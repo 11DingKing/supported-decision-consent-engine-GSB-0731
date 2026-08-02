@@ -127,14 +127,30 @@ module Consent
       created(ledger.review_emergency(emergency_id: params["id"], at: b["at"]))
     end
 
+    post "/emergencies/:id/consumption" do
+      b = json_body
+      created(ledger.consume_emergency(
+        emergency_id: params["id"], consumption_id: b["consumptionId"],
+        minutes: b["minutes"], at: b["at"]
+      ))
+    end
+
+    post "/emergencies/:id/revocation" do
+      b = json_body
+      created(ledger.revoke_emergency(emergency_id: params["id"], at: b["at"]))
+    end
+
     # --- Decisions ----------------------------------------------------------
 
     # Evaluate authority and record the decision. Pins (eventTime, asOfSeq).
+    # A `requestId` (body field or Idempotency-Key header) makes the recording
+    # idempotent: a resubmission returns the original outcome and boundary.
     post "/decisions" do
       b = json_body
       decision = ledger.decide(
         supporter_id: b["supporterId"], scope: b["scope"], at: b["at"],
-        as_of_seq: b["asOfSeq"], record: b.fetch("record", true)
+        as_of_seq: b["asOfSeq"], record: b.fetch("record", true),
+        request_id: b["requestId"] || request.env["HTTP_IDEMPOTENCY_KEY"]
       )
       status 200
       json(decision.to_h)

@@ -50,8 +50,16 @@ module Consent
           payload     TEXT NOT NULL,
           recorded_at TEXT NOT NULL,
           prev_hash   TEXT,
-          hash        TEXT NOT NULL UNIQUE
+          hash        TEXT NOT NULL UNIQUE,
+          request_id  TEXT
         );
+
+        -- Idempotency: a client-supplied request_id may appear at most once, so
+        -- a resubmitted decision or command collapses onto the original fact
+        -- instead of appending a duplicate (which could reset budgets or shift
+        -- the audit boundary). NULL request_ids are unconstrained.
+        CREATE UNIQUE INDEX IF NOT EXISTS events_request_id_uniq
+          ON events (request_id) WHERE request_id IS NOT NULL;
 
         -- Immutability guards: recorded facts can never be altered or removed.
         CREATE TRIGGER IF NOT EXISTS events_no_update
@@ -71,38 +79,49 @@ module Consent
     # Append a fact atomically. Returns the persisted Event (with seq + hash).
     # The whole read-tip/compute-hash/insert sequence runs inside an IMMEDIATE
     # transaction so concurrent writers cannot interleave and fork the chain.
-    def append(type:, event_time:, payload: {}, recorded_at: nil)
+    #
+    # When `request_id` is given the append is IDEMPOTENT: if a fact with that
+    # id was already recorded, the original Event is returned unchanged and no
+    # new fact is appended. This is what makes a duplicated submission a no-op —
+    # it can neither widen scope, reset an emergency budget, nor move the audit
+    # seq boundary.
+    def append(type:, event_time:, payload: {}, recorded_at: nil, request_id: nil)
       recorded_at ||= Time.now.utc
       persisted = nil
 
       transaction do
-        tip = current_tip
-        prev_hash = tip && tip["hash"]
-        next_seq = (tip && tip["seq"]).to_i + 1
+        if request_id && (existing = find_by_request_id(request_id))
+          persisted = build_event(existing)
+        else
+          tip = current_tip
+          prev_hash = tip && tip["hash"]
+          next_seq = (tip && tip["seq"]).to_i + 1
 
-        event = Event.new(
-          seq: next_seq,
-          type: type,
-          event_time: event_time,
-          payload: payload,
-          recorded_at: recorded_at,
-          prev_hash: prev_hash
-        )
+          event = Event.new(
+            seq: next_seq,
+            type: type,
+            event_time: event_time,
+            payload: payload,
+            recorded_at: recorded_at,
+            prev_hash: prev_hash
+          )
 
-        @db.execute(
-          "INSERT INTO events (seq, type, event_time, payload, recorded_at, prev_hash, hash) " \
-          "VALUES (?, ?, ?, ?, ?, ?, ?)",
-          [
-            event.seq,
-            event.type,
-            event.event_time.iso8601,
-            CanonicalJSON.dump(event.payload),
-            event.recorded_at.iso8601,
-            event.prev_hash,
-            event.hash_value
-          ]
-        )
-        persisted = event
+          @db.execute(
+            "INSERT INTO events (seq, type, event_time, payload, recorded_at, prev_hash, hash, request_id) " \
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+              event.seq,
+              event.type,
+              event.event_time.iso8601,
+              CanonicalJSON.dump(event.payload),
+              event.recorded_at.iso8601,
+              event.prev_hash,
+              event.hash_value,
+              request_id
+            ]
+          )
+          persisted = event
+        end
       end
 
       persisted
@@ -122,15 +141,7 @@ module Consent
 
       prev_hash = nil
       rows.map do |row|
-        event = Event.new(
-          seq: row["seq"],
-          type: row["type"],
-          event_time: row["event_time"],
-          payload: JSON.parse(row["payload"]),
-          recorded_at: row["recorded_at"],
-          prev_hash: row["prev_hash"],
-          hash_value: row["hash"]
-        )
+        event = build_event(row)
         unless event.valid_hash? && event.prev_hash == prev_hash
           raise TamperError, "hash chain broken at seq #{event.seq}"
         end
@@ -149,11 +160,36 @@ module Consent
       @db.get_first_value("SELECT COUNT(*) FROM events").to_i
     end
 
+    # Return the already-recorded Event for a request_id, or nil. Lets callers
+    # detect a resubmission and reproduce the original outcome without writing.
+    def event_for_request(request_id)
+      return nil if request_id.nil?
+
+      row = find_by_request_id(request_id)
+      row && build_event(row)
+    end
+
     def close
       @db.close
     end
 
     private
+
+    def build_event(row)
+      Event.new(
+        seq: row["seq"],
+        type: row["type"],
+        event_time: row["event_time"],
+        payload: JSON.parse(row["payload"]),
+        recorded_at: row["recorded_at"],
+        prev_hash: row["prev_hash"],
+        hash_value: row["hash"]
+      )
+    end
+
+    def find_by_request_id(request_id)
+      @db.get_first_row("SELECT * FROM events WHERE request_id = ? LIMIT 1", [request_id])
+    end
 
     def current_tip
       @db.get_first_row("SELECT seq, hash FROM events ORDER BY seq DESC LIMIT 1")

@@ -28,9 +28,18 @@ module Consent
 
   Emergency = Struct.new(
     :id, :supporter_id, :scope, :invoked_at, :max_minutes,
-    :reviewed_at, :created_seq,
+    :reviewed_at, :revoked_at, :created_seq, :consumptions,
     keyword_init: true
-  )
+  ) do
+    # Total minutes consumed as-of `at` (revocation does NOT erase already
+    # recorded consumption; it only stops further authority). Consumptions are
+    # deduplicated by their own request/consumption id so a replayed
+    # consumption is counted once.
+    def consumed_minutes(at)
+      (consumptions || {}).values.select { |c| !c[:at].nil? && c[:at] <= at }
+                          .sum { |c| c[:minutes] }
+    end
+  end
 
   EmergencyPolicy = Struct.new(
     :allowed_scope, :max_minutes, :requires_review_event,
@@ -135,13 +144,33 @@ module Consent
           invoked_at: Instant.parse(p["at"] || event.event_time&.iso8601),
           max_minutes: p["maxMinutes"],
           reviewed_at: nil,
-          created_seq: event.seq
+          revoked_at: nil,
+          created_seq: event.seq,
+          consumptions: {}
         )
       when "EMERGENCY_REVIEWED"
         e = @emergencies[event.payload["emergencyId"]]
         if e
           at = Instant.parse(event.payload["at"] || event.event_time&.iso8601)
           e.reviewed_at = at if e.reviewed_at.nil? || at < e.reviewed_at
+        end
+      when "EMERGENCY_CONSUMED"
+        p = event.payload
+        e = @emergencies[p["emergencyId"]]
+        if e
+          # Keyed by consumption id so a replayed consumption is idempotent:
+          # recording it twice with the same id does not double-count minutes.
+          e.consumptions[p["consumptionId"]] ||= {
+            minutes: p["minutes"].to_i,
+            at: Instant.parse(p["at"] || event.event_time&.iso8601)
+          }
+        end
+      when "EMERGENCY_REVOKED"
+        e = @emergencies[event.payload["emergencyId"]]
+        if e
+          at = Instant.parse(event.payload["at"] || event.event_time&.iso8601)
+          # Monotonic: the earliest revocation wins and can never be loosened.
+          e.revoked_at = at if e.revoked_at.nil? || at < e.revoked_at
         end
       when "EMERGENCY_POLICY_SET"
         p = event.payload

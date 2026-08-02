@@ -114,4 +114,46 @@ class ApiTest < Minitest::Test
       assert_equal true, link["scopesRedacted"]
     end
   end
+
+  def test_duplicate_decision_over_http_is_idempotent
+    payload = { "supporterId" => "SUPPORTER-A", "scope" => "LEGAL_AID_APPLICATION",
+                "at" => "2026-09-01T00:00:00Z", "requestId" => "http-dup-1" }
+    first = post_json("/decisions", payload)
+    get "/events"
+    count_after_first = JSON.parse(last_response.body)["events"].length
+
+    dup = post_json("/decisions", payload)
+    get "/events"
+    count_after_dup = JSON.parse(last_response.body)["events"].length
+
+    assert_equal first["reasonCode"], dup["reasonCode"]
+    assert_equal first["asOfSeq"], dup["asOfSeq"]
+    assert_equal first["authorityChain"], dup["authorityChain"]
+    assert_equal count_after_first, count_after_dup, "resubmission must not append a second audit fact"
+  end
+
+  def test_emergency_consumption_and_revocation_over_http
+    post_json("/supporters", { "supporterId" => "SUP-E" })
+    post_json("/emergency-policy",
+      { "allowedScope" => "LEGAL_AID_APPLICATION", "maxMinutes" => 30, "requiresReviewEvent" => false })
+    post_json("/emergencies",
+      { "id" => "E-HTTP", "supporterId" => "SUP-E", "scope" => "LEGAL_AID_APPLICATION",
+        "at" => "2026-06-01T12:00:00Z", "maxMinutes" => 30 })
+    # Consume 30 twice with the same id → still exhausted, not double counted
+    # (would be no different visibly, but the second must not error/reset).
+    post_json("/emergencies/E-HTTP/consumption",
+      { "consumptionId" => "cc1", "minutes" => 30, "at" => "2026-06-01T12:05:00Z" })
+    post_json("/emergencies/E-HTTP/consumption",
+      { "consumptionId" => "cc1", "minutes" => 30, "at" => "2026-06-01T12:05:00Z" })
+    exhausted = post_json("/decisions",
+      { "supporterId" => "SUP-E", "scope" => "LEGAL_AID_APPLICATION",
+        "at" => "2026-06-01T12:06:00Z", "record" => false })
+    assert_equal "EMERGENCY_BUDGET_EXHAUSTED", exhausted["reasonCode"]
+
+    post_json("/emergencies/E-HTTP/revocation", { "at" => "2026-06-01T12:07:00Z" })
+    revoked = post_json("/decisions",
+      { "supporterId" => "SUP-E", "scope" => "LEGAL_AID_APPLICATION",
+        "at" => "2026-06-01T12:08:00Z", "record" => false })
+    assert_equal "EMERGENCY_REVOKED", revoked["reasonCode"]
+  end
 end

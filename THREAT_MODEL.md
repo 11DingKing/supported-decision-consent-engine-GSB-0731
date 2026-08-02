@@ -47,6 +47,72 @@ through, or because a natural expiry masked the real cause (revocation).
 
 ---
 
+## 1a. `REVOKE-1` vs. an in-flight decision — microsecond race, duplicates, budget (round 3)
+
+**Threat.** A decision is *in flight* when `REVOKE-1` lands. The dangers: the
+in-flight decision is honoured (silence = yes); the microsecond boundary is
+rounded away so "just before / exactly at / just after" collapse into one
+answer; revocation events arrive **out of order** and a later one loosens an
+earlier withdrawal; the **same decision is resubmitted** and appends a fresh
+fact that widens scope or shifts the audit boundary; a **duplicated emergency
+consumption** double-drains or *resets* the budget; or revoking an emergency
+**retroactively erases** minutes already spent.
+
+**Defence.**
+- **Microsecond precision.** `Instant` truncates to and serializes 6 fractional
+  digits, and comparisons use the underlying `Time`. A decision at
+  `t − 1µs`, `t`, and `t + 1µs` around `REVOKE-1` are three distinct,
+  reproducible facts — verified to survive a store round-trip.
+- **Boundary semantics.** `t >= revoked_at ⇒ revoked`, checked before expiry
+  (§1), so the exact-instant and just-after cases both deny; only strictly
+  before authorizes.
+- **Out-of-order revocations.** Revocation is monotonic on *event-time*: the
+  earliest instant wins regardless of the order events were recorded
+  (`Projection#apply`).
+- **Idempotent resubmission.** A decision carrying a `requestId` is recorded
+  under a unique key (`EventStore` `request_id` + partial unique index). A
+  resubmission returns the **original** reason code, authority chain, and the
+  **same pinned `asOfSeq`** without appending a second fact (`Ledger#decide` →
+  `decision_from_event`). It can neither widen scope, reset a budget, nor move
+  the audit boundary.
+- **Emergency budget.** `max_minutes` doubles as a consumable minute budget.
+  Consumption is recorded as immutable `EMERGENCY_CONSUMED` facts, idempotent by
+  `consumptionId` (deduped in the projection), and accounted **as-of** the
+  decision instant. Once cumulative consumption reaches the budget →
+  `EMERGENCY_BUDGET_EXHAUSTED`. A duplicate consumption is a no-op.
+- **Emergency revocation is non-destructive.** `EMERGENCY_REVOKED` stops further
+  authority at its instant (monotonic, higher precedence than expiry/budget) but
+  never rewrites minutes consumed before it; pre-revocation instants still
+  replay as authorized.
+
+**Test evidence — `test/revocation_race_test.rb`**
+
+| Test | Asserts |
+|---|---|
+| `test_one_microsecond_before_revocation_authorized` | `t − 1µs` → `AUTHORIZED_DIRECT_CONSENT` |
+| `test_exactly_at_revocation_instant_revoked` | `t` → `CONSENT_REVOKED` |
+| `test_one_microsecond_after_revocation_revoked` | `t + 1µs` → `CONSENT_REVOKED` |
+| `test_boundary_survives_store_roundtrip` | all three hold when re-derived from the persisted log |
+| `test_out_of_order_revocations_earliest_wins` | late-then-early recording: earliest instant governs |
+| `test_pinned_decision_before_revocation_seq_unaffected` | history not rewritten by a later revocation |
+| `test_duplicate_decision_submission_is_idempotent` | same code/chain/`asOfSeq`, exactly one audit fact |
+| `test_duplicate_submission_cannot_widen_scope_across_revocation` | resubmission echoes the recorded fact; a fresh id sees the revocation |
+| `test_partial_consumption_then_revoke_preserves_history` | consume 10/30, revoke — pre-revocation replay still authorized |
+| `test_revocation_reported_before_budget_or_timeout` | revocation is the reported cause |
+| `test_budget_exhausted_when_consumption_reaches_limit` | 30/30 → `EMERGENCY_BUDGET_EXHAUSTED` |
+| `test_duplicate_consumption_does_not_double_drain_or_reset` | same `consumptionId` counted once; a new id draws further |
+| `test_consumption_before_its_time_not_yet_counted` | consumption accounted as-of the decision instant |
+| `test_concurrent_decisions_and_revocation_are_replay_stable` | concurrent decide+revoke: every recorded decision replays identically and resubmits to the same boundary |
+
+Also verified over HTTP (`test/api_test.rb`:
+`test_duplicate_decision_over_http_is_idempotent`,
+`test_emergency_consumption_and_revocation_over_http`) and against the live
+server: the microsecond boundary yields the three distinct outcomes, and a
+duplicate `requestId` leaves the event count unchanged with an identical
+`asOfSeq`.
+
+---
+
 ## 2. Delegation & re-delegation (transfer of authority)
 
 **Threat.** A supporter re-delegates authority they never held (scope creep);
@@ -236,12 +302,13 @@ Authorized: `AUTHORIZED_DIRECT_CONSENT`, `AUTHORIZED_DELEGATED_CONSENT`,
 `AUTHORIZED_EMERGENCY`.
 
 Denied (most-specific first): `DELEGATION_CYCLE`, `CONSENT_REVOKED`,
-`DELEGATION_REVOKED`, `SOURCE_CONSENT_INVALID`,
+`DELEGATION_REVOKED`, `EMERGENCY_REVOKED`, `SOURCE_CONSENT_INVALID`,
 `DELEGATION_SCOPE_EXCEEDS_SOURCE`, `DELEGATION_DURATION_EXCEEDS_SOURCE`,
 `DELEGATION_BUDGET_EXCEEDS_SOURCE`, `DELEGATION_BUDGET_EXCEEDED`,
 `DELEGATION_SOURCE_AUTHORITY_MISSING`,
 `CONSENT_EXPIRED`, `DELEGATION_EXPIRED`, `EMERGENCY_EXPIRED`,
-`EMERGENCY_REVIEW_MISSING`, `EMERGENCY_SCOPE_NOT_ALLOWED`,
+`EMERGENCY_BUDGET_EXHAUSTED`, `EMERGENCY_REVIEW_MISSING`,
+`EMERGENCY_SCOPE_NOT_ALLOWED`,
 `CONSENT_NOT_WITNESSED`, `CONSENT_NOT_YET_EFFECTIVE`,
 `DELEGATION_NOT_YET_EFFECTIVE`, `EMERGENCY_NOT_YET_EFFECTIVE`,
 `SCOPE_NOT_IN_CONSENT`, `UNKNOWN_SUPPORTER`, `UNKNOWN_SCOPE`, `NO_CONSENT`.

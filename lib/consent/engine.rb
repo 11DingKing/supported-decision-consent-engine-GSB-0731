@@ -313,11 +313,22 @@ module Consent
       return ReasonCodes::EMERGENCY_SCOPE_NOT_ALLOWED if allowed_scope && emergency.scope != allowed_scope
       return ReasonCodes::EMERGENCY_SCOPE_NOT_ALLOWED if allowed_scope.nil?
 
+      # Revocation takes effect AT its instant (t >= revoked_at), checked before
+      # the natural timeout so a revoke during an active emergency is the
+      # reported cause. Revocation stops further authority but never rewrites
+      # the minutes already consumed before it.
+      return ReasonCodes::EMERGENCY_REVOKED if at.at_or_after?(emergency.revoked_at)
+      return ReasonCodes::EMERGENCY_NOT_YET_EFFECTIVE if at < emergency.invoked_at
+
       if max_minutes
         deadline = Instant.new(emergency.invoked_at.time + (max_minutes * 60))
         return ReasonCodes::EMERGENCY_EXPIRED if at >= deadline
+        # The time-box doubles as a consumable minute budget: once cumulative
+        # recorded consumption (as-of `at`) reaches it, the exception is spent.
+        # A resubmitted consumption is deduped in the projection, so a duplicate
+        # request can never reset or re-inflate the remaining budget.
+        return ReasonCodes::EMERGENCY_BUDGET_EXHAUSTED if emergency.consumed_minutes(at) >= max_minutes
       end
-      return ReasonCodes::EMERGENCY_NOT_YET_EFFECTIVE if at < emergency.invoked_at
 
       # Silence about review is not authority: a required review must be on
       # record (as-of seq) for the exception to hold.

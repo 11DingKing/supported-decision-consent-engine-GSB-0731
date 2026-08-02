@@ -117,13 +117,51 @@ module Consent
       append("EMERGENCY_REVIEWED", { "emergencyId" => emergency_id, "at" => normalize_time(at) }, event_time || at)
     end
 
+    # Record consumption of emergency-exception minutes. Idempotent by
+    # consumptionId: resubmitting the same consumption records the fact once, so
+    # a duplicate can never drain (or reset) the budget twice.
+    def consume_emergency(emergency_id:, consumption_id:, minutes:, at:, event_time: nil)
+      require_present!(emergency_id, "emergencyId")
+      require_present!(consumption_id, "consumptionId")
+      require_present!(at, "at")
+      raise ValidationError, "minutes must be a positive integer" unless minutes.is_a?(Integer) && minutes.positive?
+
+      payload = {
+        "emergencyId" => emergency_id,
+        "consumptionId" => consumption_id,
+        "minutes" => minutes,
+        "at" => normalize_time(at)
+      }
+      append("EMERGENCY_CONSUMED", payload, event_time || at, request_id: "consume:#{consumption_id}")
+    end
+
+    # Revoke an emergency exception at an instant. Monotonic and non-destructive:
+    # it stops further authority from `at` but never erases minutes already
+    # consumed before it.
+    def revoke_emergency(emergency_id:, at:, event_time: nil)
+      require_present!(emergency_id, "emergencyId")
+      require_present!(at, "at")
+      append("EMERGENCY_REVOKED", { "emergencyId" => emergency_id, "at" => normalize_time(at) }, event_time || at)
+    end
+
     # --- Decisions ----------------------------------------------------------
 
     # Evaluate authority and record the decision as an immutable audit event.
     # The decision is anchored to (event_time, as_of_seq); as_of_seq defaults
     # to the current audit tip captured atomically before evaluation.
-    def decide(supporter_id:, scope:, at:, as_of_seq: nil, record: true)
+    #
+    # When `request_id` is supplied the recording is IDEMPOTENT: a resubmitted
+    # decision reproduces the original outcome — same reason code, same
+    # authority chain, and the SAME as_of_seq boundary that was pinned the first
+    # time — without appending a second audit fact. A duplicate submission can
+    # therefore never widen scope, reset a budget, or shift the audit boundary.
+    def decide(supporter_id:, scope:, at:, as_of_seq: nil, record: true, request_id: nil)
       at_norm = normalize_time(at)
+
+      if record && request_id && (prior = @store.event_for_request("decision:#{request_id}"))
+        return decision_from_event(prior)
+      end
+
       seq_ceiling = as_of_seq || @store.max_seq
       decision = evaluate(supporter_id: supporter_id, scope: scope, at: at_norm, as_of_seq: seq_ceiling)
 
@@ -139,7 +177,8 @@ module Consent
             "reasonCode" => decision.reason_code,
             "authorityChain" => decision.authority_chain
           },
-          at_norm
+          at_norm,
+          request_id: request_id && "decision:#{request_id}"
         )
       end
 
@@ -167,8 +206,23 @@ module Consent
 
     private
 
-    def append(type, payload, event_time)
-      @store.append(type: type, event_time: event_time || Time.now.utc, payload: payload)
+    def append(type, payload, event_time, request_id: nil)
+      @store.append(type: type, event_time: event_time || Time.now.utc, payload: payload, request_id: request_id)
+    end
+
+    # Rebuild the original Decision from a previously recorded DECISION_REQUESTED
+    # event, so a replayed decision returns byte-identical anchors and chain.
+    def decision_from_event(event)
+      p = event.payload
+      Engine::Decision.new(
+        authorized: p["authorized"],
+        reason_code: p["reasonCode"],
+        authority_chain: p["authorityChain"],
+        supporter_id: p["supporterId"],
+        scope: p["scope"],
+        event_time: Instant.parse(p["at"]),
+        as_of_seq: p["asOfSeq"]
+      )
     end
 
     def require_present!(value, name)

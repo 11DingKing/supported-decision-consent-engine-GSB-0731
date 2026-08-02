@@ -74,7 +74,9 @@ Boundary rules (chosen once, applied everywhere):
 | `POST /emergency-policy` | set the emergency exception policy |
 | `POST /emergencies` | invoke an emergency |
 | `POST /emergencies/:id/review` | record a mandated review |
-| `POST /decisions` | evaluate authority and **record** the decision |
+| `POST /emergencies/:id/consumption` | consume budget minutes (idempotent by `consumptionId`) |
+| `POST /emergencies/:id/revocation` | revoke an emergency at an instant (non-destructive) |
+| `POST /decisions` | evaluate authority and **record** the decision (idempotent with `requestId` / `Idempotency-Key`) |
 | `POST /decisions/replay` | re-evaluate at fixed `(at, asOfSeq)` without recording |
 | `GET  /events` | dump the immutable, hash-chained audit log |
 
@@ -101,6 +103,10 @@ See [THREAT_MODEL.md](THREAT_MODEL.md) for the full mapping. Summary:
 
 - **Revocation** — `test/revocation_test.rb`: exact-instant denial, monotonicity,
   precedence over expiry, replay before the revocation seq.
+- **Revocation race (microsecond / duplicates / budget)** — `test/revocation_race_test.rb`:
+  `t−1µs`/`t`/`t+1µs` boundary, out-of-order revocations, idempotent
+  resubmission (stable reason code, chain, and `asOfSeq`), emergency-budget
+  consumption + non-destructive emergency revocation.
 - **Delegation / re-delegation** — `test/delegation_test.rb`: multi-level chains,
   scope-exceeds-source, source expiry/revocation collapse, cycle detection.
 - **Concurrent sub-delegation** — `test/sub_delegation_test.rb`: scope/duration/

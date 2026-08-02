@@ -13,8 +13,16 @@ module Consent
   #     revocation instant is treated as revoked (t >= revoked_at => revoked).
   # These closed/open choices make "the decision at the exact revocation
   # instant" deterministic rather than a coin flip.
+  #
+  # Precision: serialization keeps MICROSECOND resolution (6 fractional
+  # digits). Comparisons use the underlying Time (nanosecond precise), so a
+  # decision one microsecond before vs. one microsecond after a revocation is a
+  # distinct, reproducible fact — the race is resolved by the recorded instant,
+  # never by wall-clock rounding.
   class Instant
     include Comparable
+
+    FRACTIONAL_DIGITS = 6
 
     attr_reader :time
 
@@ -33,7 +41,13 @@ module Consent
     end
 
     def initialize(time)
-      @time = time.utc
+      # Truncate to microsecond precision so the comparison semantics match the
+      # serialized form exactly: an Instant stored to the event log and reparsed
+      # must compare identical to the original. This is what keeps the
+      # microsecond-boundary race (t-1µs / t / t+1µs) reproducible across
+      # replays rather than drifting on sub-microsecond noise.
+      utc = time.utc
+      @time = Time.at(utc.to_i, utc.nsec / 1000, :microsecond).utc
     end
 
     def <=>(other)
@@ -58,7 +72,7 @@ module Consent
     end
 
     def iso8601
-      time.iso8601
+      time.iso8601(FRACTIONAL_DIGITS)
     end
 
     def to_s
