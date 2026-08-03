@@ -283,14 +283,108 @@ and [sub_delegation_concurrency_test.rb](../test/sub_delegation_concurrency_test
 | Concurrent grant+revoke then late delegation | `test_concurrent_grant_and_revoke_with_late_delegation` | `DELEGATION_LATE_ARRIVAL` |
 | 6 concurrent broad delegations | `test_concurrent_broad_delegations_never_authorize` | `DELEGATION_BROADER_THAN_SOURCE` |
 
-## 8. Reason codes
+## 8. Round 3: revocation race, idempotency, and emergency budget
+
+This round hardens the `REVOKE-1` race with in-flight decisions and closes the
+remaining vectors for expanding scope or resetting budget through repeated
+submission. It reuses round-1 event-time semantics and round-2 chains/budgets.
+
+### 8.1 Microsecond revocation boundary
+
+Time comparisons use `Time` with microsecond precision. The three boundary cases
+are distinct and deterministic:
+
+| Decision time relative to `revokedAt` | Result |
+|----------------------------------------|--------|
+| 1 µs before (`t < revokedAt`) | `AUTHORIZED` |
+| exactly equal (`t == revokedAt`) | `REVOKED` |
+| 1 µs after (`t > revokedAt`) | `REVOKED` |
+
+The revocation instant is inclusive (`t >= revokedAt` ⇒ revoked). A decision
+pinned one microsecond before the revoke remains `AUTHORIZED` on replay because
+it was evaluated against the event prefix that did not yet contain the
+revocation.
+
+### 8.2 Out-of-order revocations
+
+If two `ConsentRevoked` events target the same consent, the replay takes the
+**earliest** `occurred_at` as the effective revocation time, regardless of
+sequence order. A late-arriving revocation with an earlier timestamp cannot
+rewrite a historical decision: that decision was pinned to the sequence prefix
+it saw, and replay against that prefix reproduces the original outcome. A
+duplicate revocation with the same `event_id` is idempotent (no new event row).
+
+### 8.3 Decision idempotency
+
+`POST /decisions` accepts an optional `decisionId` / `idempotencyKey`. When
+provided:
+
+- If a `DecisionRecorded` with that ID already exists, the stored result is
+  returned unchanged with `idempotent: true` — no new event is appended and no
+  budget is consumed.
+- If the same key is reused with **different** decision parameters
+  (person/supporter/scope/time), the request is rejected with `ArgumentError`
+  to prevent a key from laundering a different authorization.
+- A repeat submission therefore cannot expand scope, advance `seenSequence`, or
+  reset emergency budget — it returns the exact original reason code, chain,
+  and audit-sequence boundary.
+
+The same idempotency applies to all event appends: a duplicate `event_id`
+returns the existing event rather than inserting a second row.
+
+### 8.4 Emergency budget consumption and revocation
+
+Each `EmergencyAccessStarted` carries an optional `consumedMinutes`. The
+domain layer sums consumed minutes across all prior emergency events for the
+same scope (strictly earlier than the candidate) plus the candidate's own
+consumption. If the total exceeds the policy `maxMinutes`, the result is
+`EMERGENCY_BUDGET_EXHAUSTED`. The most recent emergency is the evaluation
+candidate.
+
+When a consent is revoked after an emergency has partially consumed budget:
+
+- The consumed minutes remain recorded in the immutable event log.
+- A decision within the emergency window still returns `EMERGENCY_AUTHORIZED`
+  (emergency is the time-boxed exception), with `totalConsumedMinutes`
+  reflecting the historical consumption.
+- After the emergency window closes, the result is `EMERGENCY_TIMEOUT`.
+- Repeated submission of the same emergency (`event_id`) does not double-count
+  consumption; repeated submission of the same decision does not reset it.
+
+### 8.5 Round-3 test evidence
+
+All in [revocation_race_test.rb](../test/revocation_race_test.rb):
+
+| Threat | Test | Expected reason |
+|--------|------|-----------------|
+| Decision 1µs before revoke | `test_decision_one_microsecond_before_revocation_is_authorized` | `AUTHORIZED` |
+| Decision at exact revoke instant | `test_decision_at_exact_revocation_instant_is_revoked` | `REVOKED` |
+| Decision 1µs after revoke | `test_decision_one_microsecond_after_revocation_is_revoked` | `REVOKED` |
+| Three boundary results stable + idempotent replay | `test_three_boundary_results_are_stable_and_ordered` | mixed |
+| In-flight decision pinned before revoke | `test_inflight_decision_pinned_before_revoke_stays_authorized_on_replay` | `AUTHORIZED` on replay |
+| Earlier revocation arrives late | `test_earlier_revocation_arrives_later_effective_time_is_earliest` | `REVOKED` |
+| Out-of-order revoke doesn't rewrite history | `test_out_of_order_revocation_does_not_rewrite_historical_decision` | replay matches |
+| Duplicate revocation event idempotent | `test_duplicate_revocation_id_is_idempotent` | one event |
+| Repeated decision with same key | `test_repeated_decision_with_same_idempotency_key_returns_same_result` | `idempotent: true` |
+| Idempotent replay after revoke stays authorized | `test_idempotent_replay_after_revocation_preserves_original_authorization` | `AUTHORIZED` |
+| Same key, different scope rejected | `test_repeated_submission_cannot_expand_scope` | `ArgumentError` |
+| Emergency partial use then revoke | `test_emergency_partial_use_then_revoke_consumed_budget_preserved` | `EMERGENCY_AUTHORIZED`, budget preserved |
+| Duplicate emergency doesn't double-consume | `test_repeated_emergency_submission_does_not_double_consume_budget` | consumed = 10 |
+| Cumulative emergency budget exceeded | `test_cumulative_emergency_budget_cannot_exceed_source` | `EMERGENCY_BUDGET_EXHAUSTED` |
+| Emergency budget replay deterministic | `test_emergency_budget_replay_is_deterministic_after_revoke` | replay matches |
+| Repeated decision cannot reset budget | `test_repeated_submission_cannot_reset_emergency_budget` | consumed unchanged |
+| Concurrent revoke + in-flight decisions | `test_concurrent_revoke_and_inflight_decisions_never_expand_scope` | no over-broad grant |
+| 10 concurrent idempotent decisions | `test_concurrent_idempotent_decisions_produce_single_event` | exactly one event |
+
+## 9. Reason codes
 
 Authorized: `AUTHORIZED`, `EMERGENCY_AUTHORIZED`.
 
 Denials (highest priority first): `REVOKED`, `DELEGATION_SOURCE_REVOKED`,
 `DELEGATION_LATE_ARRIVAL`, `DELEGATION_BROADER_THAN_SOURCE`,
 `DELEGATION_DURATION_EXCEEDS_SOURCE`, `DELEGATION_BUDGET_EXCEEDED`,
-`DELEGATION_CUMULATIVE_BUDGET_EXCEEDED`, `DELEGATION_CYCLE`, `EXPIRED`,
+`DELEGATION_CUMULATIVE_BUDGET_EXCEEDED`, `EMERGENCY_BUDGET_EXHAUSTED`,
+`DELEGATION_CYCLE`, `EXPIRED`,
 `DELEGATION_SOURCE_EXPIRED`, `DELEGATION_EXPIRED`, `NOT_YET_VALID`,
 `DELEGATION_SOURCE_NOT_YET_VALID`, `DELEGATION_NOT_YET_VALID`, `WITNESS_MISSING`,
 `SCOPE_NOT_GRANTED`, `DELEGATION_WITHOUT_SOURCE`, `EMERGENCY_TIMEOUT`,
@@ -300,7 +394,7 @@ The priority ordering guarantees a stable, meaningful code when multiple paths
 fail: an explicit withdrawal always surfaces before a mere expiry, and an
 attempt to broaden scope always surfaces before "no consent".
 
-## 9. HTTP API
+## 10. HTTP API
 
 | Method | Path                                           | Purpose |
 |--------|------------------------------------------------|---------|
@@ -321,6 +415,12 @@ Delegation creation accepts an optional `emergencyBudgetMinutes` (integer). The
 domain layer enforces individual and cumulative bounds against the source
 consent's emergency budget. Denied decisions return a redacted `chain` with
 `sequence` on each link for audit traceability.
+
+`POST /decisions` accepts an optional `decisionId`/`idempotencyKey`; repeating
+a request with the same key returns the original result (`idempotent: true`)
+without appending a new event or consuming budget. `POST /emergencies` accepts
+optional `sourceConsentId` and `consumedMinutes` (integer) to record emergency
+budget consumption. All event-creating endpoints are idempotent on `id`/`event_id`.
 
 ### Running
 

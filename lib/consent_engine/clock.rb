@@ -15,7 +15,7 @@ module ConsentEngine
     end
 
     def iso8601(t)
-      t.utc.iso8601
+      t.utc.iso8601(6)
     end
   end
 end

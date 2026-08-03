@@ -63,8 +63,10 @@ module ConsentEngine
             cid = e.payload["consentId"]
             c = state[:consents][cid]
             if c
-              c[:revoked_at] = e.occurred_at
-              c[:revoked_sequence] = e.sequence
+              if c[:revoked_at].nil? || e.occurred_at < c[:revoked_at]
+                c[:revoked_at] = e.occurred_at
+                c[:revoked_sequence] = e.sequence
+              end
             end
           when "DelegationGranted"
             state[:delegations][e.payload["delegationId"]] = {
@@ -84,16 +86,20 @@ module ConsentEngine
             did = e.payload["delegationId"]
             d = state[:delegations][did]
             if d
-              d[:revoked_at] = e.occurred_at
-              d[:revoked_sequence] = e.sequence
+              if d[:revoked_at].nil? || e.occurred_at < d[:revoked_at]
+                d[:revoked_at] = e.occurred_at
+                d[:revoked_sequence] = e.sequence
+              end
             end
           when "EmergencyAccessStarted"
             state[:emergencies] << {
               emergency_id: e.payload["emergencyId"],
               scope: e.payload["scope"],
               supporter_id: e.payload["supporterId"],
+              source_consent_id: e.payload["sourceConsentId"],
               started_at: e.occurred_at,
               sequence: e.sequence,
+              consumed_minutes: e.payload["consumedMinutes"],
               reviewed_at: nil
             }
           when "EmergencyReviewRecorded"
@@ -341,9 +347,24 @@ module ConsentEngine
 
         candidate = state[:emergencies]
           .select { |e| e[:scope] == scope && e[:started_at] <= t }
-          .min_by { |e| e[:started_at] }
+          .max_by { |e| e[:started_at] }
 
         return nil unless candidate
+
+        prior_consumed = state[:emergencies]
+          .select { |e| e[:scope] == scope && e[:started_at] < candidate[:started_at] }
+          .sum { |e| e[:consumed_minutes].to_i }
+
+        total_consumed = prior_consumed + candidate[:consumed_minutes].to_i
+
+        if total_consumed > policy.max_minutes
+          return DecisionResult.new(
+            person_id: request[:person_id], supporter_id: supporter,
+            scope: scope, decision_at: t, seen_sequence: seen,
+            reason_code: ReasonCode::EMERGENCY_BUDGET_EXHAUSTED, chain: [],
+            emergency: emergency_meta(candidate, policy, total_consumed)
+          )
+        end
 
         deadline = candidate[:started_at] + (policy.max_minutes * 60)
         within_window = t < deadline
@@ -353,28 +374,33 @@ module ConsentEngine
             person_id: request[:person_id], supporter_id: supporter,
             scope: scope, decision_at: t, seen_sequence: seen,
             reason_code: ReasonCode::EMERGENCY_AUTHORIZED, chain: [],
-            emergency: {
-              "emergencyId" => candidate[:emergency_id],
-              "startedAt" => candidate[:started_at].iso8601,
-              "deadlineAt" => deadline.iso8601,
-              "reviewRecorded" => !candidate[:reviewed_at].nil?,
-              "reviewRequired" => policy.requires_review_event
-            }
+            emergency: emergency_meta(candidate, policy, total_consumed),
+            consumed_budget_minutes: total_consumed
           )
         else
           DecisionResult.new(
             person_id: request[:person_id], supporter_id: supporter,
             scope: scope, decision_at: t, seen_sequence: seen,
             reason_code: ReasonCode::EMERGENCY_TIMEOUT, chain: [],
-            emergency: {
-              "emergencyId" => candidate[:emergency_id],
-              "startedAt" => candidate[:started_at].iso8601,
-              "deadlineAt" => deadline.iso8601,
-              "expiredAt" => deadline.iso8601,
-              "reviewRecorded" => !candidate[:reviewed_at].nil?
-            }
+            emergency: emergency_meta(candidate, policy, total_consumed).merge(
+              "expiredAt" => deadline.iso8601(6)
+            )
           )
         end
+      end
+
+      def emergency_meta(candidate, policy, total_consumed)
+        deadline = candidate[:started_at] + (policy.max_minutes * 60)
+        {
+          "emergencyId" => candidate[:emergency_id],
+          "startedAt" => candidate[:started_at].iso8601(6),
+          "deadlineAt" => deadline.iso8601(6),
+          "reviewRecorded" => !candidate[:reviewed_at].nil?,
+          "reviewRequired" => policy.requires_review_event,
+          "consumedMinutes" => candidate[:consumed_minutes].to_i,
+          "totalConsumedMinutes" => total_consumed,
+          "budgetMinutes" => policy.max_minutes
+        }
       end
 
       def build_consent_link(c, t, redacted: false)

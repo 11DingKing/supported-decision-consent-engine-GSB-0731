@@ -86,7 +86,7 @@ module TestHelpers
     )
   end
 
-  def start_emergency(store, emergency_id:, scope:, started_at:, supporter: nil, person: "PERSON-01")
+  def start_emergency(store, emergency_id:, scope:, started_at:, supporter: nil, person: "PERSON-01", source_consent_id: nil, consumed_minutes: nil)
     store.append(
       event_type: "EmergencyAccessStarted",
       event_id: emergency_id,
@@ -95,7 +95,9 @@ module TestHelpers
       payload: {
         "emergencyId" => emergency_id,
         "scope" => scope,
-        "supporterId" => supporter
+        "supporterId" => supporter,
+        "sourceConsentId" => source_consent_id,
+        "consumedMinutes" => consumed_minutes
       }
     )
   end

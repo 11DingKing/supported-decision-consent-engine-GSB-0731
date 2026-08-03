@@ -25,6 +25,14 @@ module ConsentEngine
 
         @mutex.synchronize do
           with_db do |db|
+            existing = db.execute(
+              "SELECT sequence, event_id, event_type, person_id, payload, occurred_at, recorded_at
+               FROM events WHERE event_id = ?", [event_id]
+            ).first
+            if existing
+              return row_to_event(existing)
+            end
+
             db.execute(
               "INSERT INTO events (event_id, event_type, person_id, payload, occurred_at, recorded_at)
                VALUES (?, ?, ?, ?, ?, ?)",
@@ -43,69 +51,92 @@ module ConsentEngine
         end
       end
 
-      def evaluate_decision(person_id:, supporter_id:, scope:, at:, policy:)
+      def evaluate_decision(person_id:, supporter_id:, scope:, at:, policy:, decision_id: nil)
         at = Clock.parse_time(at)
         @mutex.synchronize do
           with_db do |db|
             db.transaction(:immediate)
-              events = read_events(db)
-              seen = events.map(&:sequence).max || 0
 
-              request = {
-                person_id: person_id,
-                supporter_id: supporter_id,
-                scope: scope,
-                at: at
-              }
-
-              result = Domain::ConsentBoundary.evaluate(events, request, policy)
-
-              decision_id = "DEC-#{SecureRandom.uuid}"
-              policy_snapshot = policy ? {
-                "allowedScope" => policy.allowed_scope,
-                "maxMinutes" => policy.max_minutes,
-                "requiresReviewEvent" => policy.requires_review_event
-              } : nil
-              payload = {
-                "decisionId" => decision_id,
-                "personId" => person_id,
-                "supporterId" => supporter_id,
-                "scope" => scope,
-                "decisionAt" => Clock.iso8601(at),
-                "seenSequence" => seen,
-                "reasonCode" => result.reason_code,
-                "authorized" => result.authorized?,
-                "chain" => result.chain.map(&:as_json),
-                "emergency" => result.emergency,
-                "policySnapshot" => policy_snapshot
-              }.compact
-
-              db.execute(
-                "INSERT INTO events (event_id, event_type, person_id, payload, occurred_at, recorded_at)
-                 VALUES (?, ?, ?, ?, ?, ?)",
-                [
-                  decision_id,
-                  "DecisionRecorded",
-                  person_id,
-                  JSON.generate(payload),
-                  Clock.iso8601(at),
-                  Clock.iso8601(Clock.now)
-                ]
-              )
-              db.commit
-
-              Domain::DecisionResult.new(
-                person_id: person_id,
-                supporter_id: supporter_id,
-                scope: scope,
-                decision_at: at,
-                seen_sequence: seen,
-                reason_code: result.reason_code,
-                chain: result.chain,
-                emergency: result.emergency,
-                decision_id: decision_id
-              )
+            if decision_id
+              existing = db.execute(
+                "SELECT sequence, event_id, event_type, person_id, payload, occurred_at, recorded_at
+                 FROM events WHERE event_id = ? AND event_type = 'DecisionRecorded'",
+                [decision_id]
+              ).first
+              if existing
+                ev = row_to_event(existing)
+                p = ev.payload
+                if p["personId"] != person_id || p["supporterId"] != supporter_id ||
+                   p["scope"] != scope || Clock.parse_time(p["decisionAt"]) != at
+                  db.rollback
+                  raise ArgumentError,
+                    "idempotency key #{decision_id} was already used with different decision parameters"
+                end
+                db.commit
+                next reconstruct_result(ev, idempotent: true)
+              end
             end
+
+            events = read_events(db)
+            seen = events.map(&:sequence).max || 0
+
+            request = {
+              person_id: person_id,
+              supporter_id: supporter_id,
+              scope: scope,
+              at: at
+            }
+
+            result = Domain::ConsentBoundary.evaluate(events, request, policy)
+
+            decision_id ||= "DEC-#{SecureRandom.uuid}"
+            policy_snapshot = policy ? {
+              "allowedScope" => policy.allowed_scope,
+              "maxMinutes" => policy.max_minutes,
+              "requiresReviewEvent" => policy.requires_review_event
+            } : nil
+            payload = {
+              "decisionId" => decision_id,
+              "personId" => person_id,
+              "supporterId" => supporter_id,
+              "scope" => scope,
+              "decisionAt" => Clock.iso8601(at),
+              "seenSequence" => seen,
+              "reasonCode" => result.reason_code,
+              "authorized" => result.authorized?,
+              "chain" => result.chain.map(&:as_json),
+              "emergency" => result.emergency,
+              "consumedBudgetMinutes" => result.consumed_budget_minutes,
+              "policySnapshot" => policy_snapshot
+            }.compact
+
+            db.execute(
+              "INSERT INTO events (event_id, event_type, person_id, payload, occurred_at, recorded_at)
+               VALUES (?, ?, ?, ?, ?, ?)",
+              [
+                decision_id,
+                "DecisionRecorded",
+                person_id,
+                JSON.generate(payload),
+                Clock.iso8601(at),
+                Clock.iso8601(Clock.now)
+              ]
+            )
+            db.commit
+
+            Domain::DecisionResult.new(
+              person_id: person_id,
+              supporter_id: supporter_id,
+              scope: scope,
+              decision_at: at,
+              seen_sequence: seen,
+              reason_code: result.reason_code,
+              chain: result.chain,
+              emergency: result.emergency,
+              decision_id: decision_id,
+              consumed_budget_minutes: result.consumed_budget_minutes
+            )
+          end
         end
       end
 
@@ -252,6 +283,39 @@ module ConsentEngine
           [sequence]
         ).first
         row_to_event(row) if row
+      end
+
+      def reconstruct_result(event, idempotent: false)
+        p = event.payload
+        chain = (p["chain"] || []).map do |link|
+          Domain::ChainLink.new(
+            kind: link["kind"].to_sym,
+            id: link["id"],
+            from_subject: link["fromSubject"],
+            to_supporter_id: link["toSupporterId"],
+            scopes: link["scopes"] || [],
+            window: nil,
+            witness_id: link["witnessId"],
+            source_consent_id: link["sourceConsentId"],
+            status: link["status"],
+            occurred_at: link["occurredAt"] ? Clock.parse_time(link["occurredAt"]) : nil,
+            redacted: link["redacted"] || false,
+            sequence: link["sequence"]
+          )
+        end
+        Domain::DecisionResult.new(
+          person_id: p["personId"],
+          supporter_id: p["supporterId"],
+          scope: p["scope"],
+          decision_at: Clock.parse_time(p["decisionAt"]),
+          seen_sequence: p["seenSequence"],
+          reason_code: p["reasonCode"],
+          chain: chain,
+          emergency: p["emergency"],
+          decision_id: p["decisionId"],
+          idempotent: idempotent,
+          consumed_budget_minutes: p["consumedBudgetMinutes"]
+        )
       end
 
       def row_to_event(row)

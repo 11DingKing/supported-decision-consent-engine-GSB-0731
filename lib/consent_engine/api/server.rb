@@ -170,7 +170,9 @@ module ConsentEngine
           payload: {
             "emergencyId" => emergency_id,
             "scope" => data["scope"],
-            "supporterId" => data["supporterId"]
+            "supporterId" => data["supporterId"],
+            "sourceConsentId" => data["sourceConsentId"],
+            "consumedMinutes" => data["consumedMinutes"]
           }
         )
         status 201
@@ -198,12 +200,14 @@ module ConsentEngine
         data = parse_body
         require_fields(data, "personId", "supporterId", "scope", "at")
 
+        idem_key = data["decisionId"] || data["idempotencyKey"]
         result = store.evaluate_decision(
           person_id: data["personId"],
           supporter_id: data["supporterId"],
           scope: data["scope"],
           at: data["at"],
-          policy: policy
+          policy: policy,
+          decision_id: idem_key
         )
         status 200
         JSON.generate(result.as_json)
