@@ -48,7 +48,7 @@ module TestHelpers
     )
   end
 
-  def delegate(store, delegation_id:, source_consent:, from_sup:, to_sup:, scopes:, occurred_at:, valid_to: nil, person: "PERSON-01")
+  def delegate(store, delegation_id:, source_consent:, from_sup:, to_sup:, scopes:, occurred_at:, valid_to: nil, emergency_budget_minutes: nil, person: "PERSON-01")
     store.append(
       event_type: "DelegationGranted",
       event_id: delegation_id,
@@ -60,7 +60,8 @@ module TestHelpers
         "fromSupporterId" => from_sup,
         "toSupporterId" => to_sup,
         "scopes" => Array(scopes),
-        "validTo" => valid_to
+        "validTo" => valid_to,
+        "emergencyBudgetMinutes" => emergency_budget_minutes
       }
     )
   end

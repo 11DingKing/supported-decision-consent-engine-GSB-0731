@@ -141,7 +141,8 @@ module ConsentEngine
             "fromSupporterId" => data["fromSupporterId"],
             "toSupporterId" => data["toSupporterId"],
             "scopes" => Array(data["scopes"]),
-            "validTo" => data["validTo"]
+            "validTo" => data["validTo"],
+            "emergencyBudgetMinutes" => data["emergencyBudgetMinutes"]
           }
         )
         status 201

@@ -75,7 +75,8 @@ class ConsentBoundaryTest < Minitest::Test
   def test_not_yet_valid_consent
     store = fresh_store
     grant_consent(store, consent_id: "C1", supporter: "A", scopes: ["HOUSING_APPLICATION"],
-                  from: "2026-12-01T00:00:00Z", to: "2026-12-31T00:00:00Z")
+                  from: "2026-12-01T00:00:00Z", to: "2026-12-31T00:00:00Z",
+                  occurred_at: "2026-08-01T00:00:00Z")
 
     result = store.evaluate_decision(
       person_id: "PERSON-01", supporter_id: "A",
@@ -170,7 +171,11 @@ class ConsentBoundaryTest < Minitest::Test
 
     refute result.authorized?
     assert_equal "DELEGATION_BROADER_THAN_SOURCE", result.reason_code
-    assert_empty result.chain
+    refute_empty result.chain
+    assert_equal ["C1", "DBROAD"], result.chain.map(&:id)
+    assert result.chain.all?(&:redacted), "denied sub-chain evidence must be redacted"
+    assert result.chain.all? { |l| l.scopes.to_a.empty? }, "redacted chain must not leak scopes"
+    assert result.chain.all? { |l| l.witness_id.nil? }, "redacted chain must not leak witness"
   end
 
   def test_multi_level_delegation_narrows_scope

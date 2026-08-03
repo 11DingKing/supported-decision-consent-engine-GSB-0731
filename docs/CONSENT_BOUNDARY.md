@@ -189,12 +189,108 @@ These are exact, testable boundaries — there is no "close enough".
 - `test_concurrent_appends_preserve_monotonic_sequences` — 50 concurrent appends
   yield exactly sequences 1..50 with no duplicates.
 
-## 7. Reason codes
+## 7. Round 2: sub-delegation boundaries
+
+This round hardens transitive (sub-)delegation. It reuses the round-1
+`CONSENT-1` / `SUPPORTER-A` / `SUPPORTER-B` identifiers, scopes, witness `W-1`,
+and event sequences.
+
+### 7.1 Bounds a sub-delegation must never exceed
+
+A sub-delegation is valid only when all of the following hold against its
+**source consent**:
+
+1. **Scope** — every delegated scope is a subset of the source's scopes
+   (`DELEGATION_BROADER_THAN_SOURCE`). This is checked at every hop, so a
+   multi-level chain can only narrow.
+2. **Duration** — the delegation's `validTo` is not later than the source's
+   `validTo` (`DELEGATION_DURATION_EXCEEDS_SOURCE`). A delegate cannot outlive
+   the authority that empowered them.
+3. **Emergency budget (individual)** — if the delegation carries
+   `emergencyBudgetMinutes`, it must not exceed the source's emergency budget
+   (derived from policy: `maxMinutes` when the source covers the emergency
+   scope) (`DELEGATION_BUDGET_EXCEEDED`).
+4. **Emergency budget (cumulative)** — the sum of `emergencyBudgetMinutes`
+   across all **active** (non-revoked, non-expired, in-window) sub-delegations
+   from the same source must not exceed the source's budget
+   (`DELEGATION_CUMULATIVE_BUDGET_EXCEEDED`). Revoked sub-delegations do not
+   count. When over-committed, no sub-delegation can rely on emergency
+   authority.
+5. **Witness** — the source consent must carry a witness (`WITNESS_MISSING`).
+
+### 7.2 Validity by event time AND audit sequence
+
+A decision at time `t` with audit position `seenSequence` sees only events that
+satisfy **both**:
+
+- `sequence <= seenSequence` (audit order — events recorded after the decision
+  are invisible), and
+- `occurred_at <= t` (event time — future-dated events cannot affect a past
+  decision).
+
+This two-dimensional visibility prevents a late-appended event from rewriting
+a past decision and prevents a future-dated grant from leaking backward.
+
+Ordering violations on sub-delegations produce distinct codes:
+
+- `DELEGATION_SOURCE_REVOKED` — the delegation was made (`grantedAt`) at or
+  after the source revocation instant.
+- `DELEGATION_LATE_ARRIVAL` — the delegation's `grantedAt` is before the
+  revocation, but its **audit sequence** is after the revocation sequence
+  (saved after the source was already withdrawn).
+- `DELEGATION_SOURCE_EXPIRED` / `DELEGATION_SOURCE_NOT_YET_VALID` — the source
+  was not active when the delegation was made.
+
+### 7.3 Redacted chain evidence on denial
+
+A rejected sub-delegation still returns a `chain` so auditors can see which
+consent and which delegation link were evaluated. Denied links are **redacted**:
+
+- `scopes` is `[]` and `redacted: true` is set,
+- `witnessId` is omitted,
+- but `id`, `kind`, `fromSubject`, `toSupporterId`, `sourceConsentId`, window,
+  status, and `sequence` remain as evidence.
+
+Reason codes never embed a scope name, so a denial cannot leak which scopes
+exist beyond the structural IDs in the chain. The redaction is performed in the
+domain layer (`build_consent_link`/`build_delegation_link` with `redacted:
+true`), not in the HTTP layer.
+
+### 7.4 Round-2 test evidence
+
+All in [sub_delegation_boundary_test.rb](../test/sub_delegation_boundary_test.rb)
+and [sub_delegation_concurrency_test.rb](../test/sub_delegation_concurrency_test.rb):
+
+| Threat | Test | Reason code |
+|--------|------|-------------|
+| `DELEG-BROAD` grants MEDICAL from a LEGAL/HOUSING source | `test_deleg_broad_is_rejected_with_redacted_evidence` | `DELEGATION_BROADER_THAN_SOURCE` |
+| Concurrent `DELEG-OK` + `DELEG-BROAD` evaluated independently | `test_concurrent_deleg_ok_and_deleg_broad_both_evaluated_independently` | `AUTHORIZED` / `DELEGATION_BROADER_THAN_SOURCE` |
+| Delegation validTo past source validTo | `test_delegation_duration_exceeding_source_is_rejected` | `DELEGATION_DURATION_EXCEEDS_SOURCE` |
+| Individual 60-min budget > 30-min source | `test_individual_emergency_budget_exceeding_source_is_rejected` | `DELEGATION_BUDGET_EXCEEDED` |
+| Two 20-min sub-chains exceed 30-min source | `test_two_sub_chains_cumulative_emergency_budget_exceeded` | `DELEGATION_CUMULATIVE_BUDGET_EXCEEDED` |
+| Two 15-min sub-chains within 30-min source | `test_cumulative_budget_within_limit_authorizes` | `AUTHORIZED` |
+| Revoked sub-chain removed from cumulative sum | `test_revoked_sub_chain_does_not_count_toward_cumulative_budget` | `AUTHORIZED` |
+| Source revoked before sub-chain saved (sequence ordering) | `test_source_revoked_before_sub_chain_saved_is_late_arrival` | `DELEGATION_LATE_ARRIVAL` |
+| Delegation after source expiry | `test_delegation_after_source_expiry_is_source_expired` | `DELEGATION_SOURCE_EXPIRED` |
+| Source revoked at decision time cascades | `test_source_revoked_at_decision_time_cascades` | `DELEGATION_SOURCE_REVOKED` |
+| Circular sub-chain B→C→B | `test_circular_sub_chain_is_rejected_with_evidence` | `DELEGATION_CYCLE` |
+| Future-dated event invisible to past decision | `test_event_time_filter_future_dated_event_does_not_affect_past_decision` | `NO_CONSENT` |
+| Reason code stable across repeated evaluation | `test_reason_code_is_stable_across_repeated_evaluations` | stable |
+| Rejected sub-chain replay matches | `test_rejected_sub_chain_replay_produces_identical_reason_and_chain` | reason + chain match |
+| Chain evidence carries audit sequences | `test_chain_evidence_carries_audit_sequences` | sequences `[1,2]` |
+| Witness requirement propagates to sub-chain | `test_witness_requirement_propagates_to_sub_chain` | `WITNESS_MISSING` |
+| 8 concurrent 10-min delegations vs 30-min budget | `test_concurrent_sub_delegations_never_expand_budget` | at most 3 `AUTHORIZED`, rest `CUMULATIVE` |
+| Concurrent grant+revoke then late delegation | `test_concurrent_grant_and_revoke_with_late_delegation` | `DELEGATION_LATE_ARRIVAL` |
+| 6 concurrent broad delegations | `test_concurrent_broad_delegations_never_authorize` | `DELEGATION_BROADER_THAN_SOURCE` |
+
+## 8. Reason codes
 
 Authorized: `AUTHORIZED`, `EMERGENCY_AUTHORIZED`.
 
 Denials (highest priority first): `REVOKED`, `DELEGATION_SOURCE_REVOKED`,
-`DELEGATION_BROADER_THAN_SOURCE`, `DELEGATION_CYCLE`, `EXPIRED`,
+`DELEGATION_LATE_ARRIVAL`, `DELEGATION_BROADER_THAN_SOURCE`,
+`DELEGATION_DURATION_EXCEEDS_SOURCE`, `DELEGATION_BUDGET_EXCEEDED`,
+`DELEGATION_CUMULATIVE_BUDGET_EXCEEDED`, `DELEGATION_CYCLE`, `EXPIRED`,
 `DELEGATION_SOURCE_EXPIRED`, `DELEGATION_EXPIRED`, `NOT_YET_VALID`,
 `DELEGATION_SOURCE_NOT_YET_VALID`, `DELEGATION_NOT_YET_VALID`, `WITNESS_MISSING`,
 `SCOPE_NOT_GRANTED`, `DELEGATION_WITHOUT_SOURCE`, `EMERGENCY_TIMEOUT`,
@@ -204,7 +300,7 @@ The priority ordering guarantees a stable, meaningful code when multiple paths
 fail: an explicit withdrawal always surfaces before a mere expiry, and an
 attempt to broaden scope always surfaces before "no consent".
 
-## 8. HTTP API
+## 9. HTTP API
 
 | Method | Path                                           | Purpose |
 |--------|------------------------------------------------|---------|
@@ -220,6 +316,11 @@ attempt to broaden scope always surfaces before "no consent".
 | GET    | `/decisions/:id/verify`                        | replay and compare |
 | GET    | `/events`                                      | list audit events |
 | GET    | `/events/:sequence`                            | fetch a single event |
+
+Delegation creation accepts an optional `emergencyBudgetMinutes` (integer). The
+domain layer enforces individual and cumulative bounds against the source
+consent's emergency budget. Denied decisions return a redacted `chain` with
+`sequence` on each link for audit traceability.
 
 ### Running
 
