@@ -32,6 +32,24 @@ module ConsentEngine
     DELEGATION_BEFORE_SOURCE       = "DELEGATION_BEFORE_SOURCE"   # delegation event predates source grant
     DELEGATION_SOURCE_SCOPE_MISSING= "DELEGATION_SOURCE_SCOPE_MISSING"
 
+    # --- Round 2: concurrent sub-delegation / cumulative budget / seq-order ---
+    # Generic, non-scope-leaking denial returned to a sub-delegation holder
+    # whose chain is structurally invalid. The detailed reason is retained in
+    # the immutable audit chain but NOT exposed in the top-level code, so an
+    # attacker cannot enumerate which scopes a source does or does not have.
+    DELEGATION_DENIED              = "DELEGATION_DENIED"
+    # A sub-delegation was appended (seq) AFTER a revocation of its source,
+    # even though its business effective_at claims to be earlier. The audit
+    # sequence makes this impossible to accept.
+    DELEGATION_AFTER_REVOCATION    = "DELEGATION_AFTER_REVOCATION"
+    # Two or more sibling sub-delegations from the same source together
+    # exceed the source's delegated budget (scope count, time window, or
+    # emergency minutes).
+    DELEGATION_BUDGET_EXCEEDED     = "DELEGATION_BUDGET_EXCEEDED"
+    # A sub-delegation arrived too late to be evaluated against the source
+    # state it claims; it must be rejected to preserve determinism.
+    DELEGATION_LATE                = "DELEGATION_LATE"
+
     # --- Emergency ---
     EMERGENCY_SCOPE_NOT_ALLOWED    = "EMERGENCY_SCOPE_NOT_ALLOWED"
     EMERGENCY_TIMEOUT              = "EMERGENCY_TIMEOUT"

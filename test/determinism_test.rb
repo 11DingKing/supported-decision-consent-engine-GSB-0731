@@ -146,16 +146,21 @@ class DeterminismTest < Minitest::Test
     refute d2.granted?
     assert_equal ConsentEngine::ReasonCodes::REVOKED, d2.reason_code
 
-    # SUPPORTER-B via DELEG-OK before revocation: granted through chain.
+    # SUPPORTER-B via DELEG-OK: the chain itself is valid, but a sibling
+    # DELEG-BROAD carries MEDICAL_INFORMATION_VIEW which is outside the
+    # source consent's scope set. The cumulative scope-union budget is
+    # exceeded (Round 2), so B is denied with a stable non-scope-leaking code.
     d3 = svc.decide(
       person_id: "PERSON-01", supporter_id: "SUPPORTER-B",
       scope: "LEGAL_AID_APPLICATION", as_of: "2026-09-01T00:00:00Z"
     )
-    assert d3.granted?
-    assert_equal ConsentEngine::ReasonCodes::GRANTED_VIA_DELEGATION, d3.reason_code
+    refute d3.granted?
+    assert_equal ConsentEngine::ReasonCodes::DELEGATION_BUDGET_EXCEEDED, d3.reason_code
     assert_equal %w[CONSENT-1 DELEG-OK], d3.chain.map(&:event_id)
 
     # DELEG-BROAD attempts MEDICAL_INFORMATION_VIEW but source lacks it.
+    # The hop itself is broad, so the more specific DELEGATION_BROAD is
+    # returned (rather than the cumulative budget code).
     d4 = svc.decide(
       person_id: "PERSON-01", supporter_id: "SUPPORTER-B",
       scope: "MEDICAL_INFORMATION_VIEW", as_of: "2026-09-01T00:00:00Z"

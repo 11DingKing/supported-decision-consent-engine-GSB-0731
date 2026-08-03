@@ -5,6 +5,7 @@ require_relative "consent_engine/reason_codes"
 require_relative "consent_engine/event"
 require_relative "consent_engine/authorization_decision"
 require_relative "consent_engine/event_store"
+require_relative "consent_engine/delegation_budget"
 require_relative "consent_engine/authorizer"
 require_relative "consent_engine/service"
 

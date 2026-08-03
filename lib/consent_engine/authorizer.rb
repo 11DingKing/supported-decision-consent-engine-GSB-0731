@@ -13,7 +13,9 @@ module ConsentEngine
       ReasonCodes::PERSON_OR_SUPPORTER_UNKNOWN => 100,
       ReasonCodes::REVOKED_BEFORE_GRANT        => 90,
       ReasonCodes::REVOKED                     => 80,
+      ReasonCodes::DELEGATION_AFTER_REVOCATION => 75,
       ReasonCodes::DELEGATION_CYCLE            => 70,
+      ReasonCodes::DELEGATION_BUDGET_EXCEEDED  => 65,
       ReasonCodes::DELEGATION_BROAD            => 60,
       ReasonCodes::DELEGATION_SOURCE_SCOPE_MISSING => 59,
       ReasonCodes::WITNESS_MISSING             => 50,
@@ -21,12 +23,14 @@ module ConsentEngine
       ReasonCodes::DELEGATION_EXPIRED          => 35,
       ReasonCodes::DELEGATION_SOURCE_EXPIRED   => 30,
       ReasonCodes::DELEGATION_BEFORE_SOURCE    => 25,
+      ReasonCodes::DELEGATION_LATE             => 24,
       ReasonCodes::EXPIRED                     => 20,
       ReasonCodes::NOT_YET_VALID               => 15,
       ReasonCodes::EMERGENCY_TIMEOUT           => 12,
       ReasonCodes::EMERGENCY_WITHOUT_REVIEW_EVENT => 11,
       ReasonCodes::EMERGENCY_SCOPE_NOT_ALLOWED => 10,
       ReasonCodes::SCOPE_MISSING               => 5,
+      ReasonCodes::DELEGATION_DENIED           => 2,
       ReasonCodes::SILENT_NO_CONSENT           => 0
     }.freeze
 
@@ -238,9 +242,18 @@ module ConsentEngine
       root_consents.each do |root|
         next unless @supporter_id != root.payload["supporterId"]
 
+        # At the first hop, only delegations that explicitly cite this root
+        # consent as their sourceConsentId may leave it. This prevents a
+        # delegation under consent C2 from being treated as authority under
+        # a different consent C1 held by the same supporter.
+        root_delegations = all_delegations.select do |d|
+          d.payload["sourceConsentId"] == root.event_id
+        end
+
         result = walk_chain(
           current_event: root,
-          delegations: all_delegations,
+          delegations: root_delegations,
+          all_delegations: all_delegations,
           visited_deleg_ids: [],
           chain_acc: [consent_link(root)]
         )
@@ -256,7 +269,14 @@ module ConsentEngine
     # @supporter_id. This is critical: without target-awareness, an invalid
     # delegation between two unrelated supporters would surface as a denial
     # for a third party, incorrectly replacing SILENT_NO_CONSENT.
-    def walk_chain(current_event:, delegations:, visited_deleg_ids:, chain_acc:)
+    #
+    # +delegations+ is the set of outgoing delegations from the current hop
+    # (filtered by sourceConsentId for the first hop). +all_delegations+ is
+    # the full set, used to find onward hops after a delegation (where the
+    # "source" for the next hop is the delegation itself, identified by
+    # matching fromSupporterId — a sub-delegation does not repeat the
+    # original consent id in sourceConsentId).
+    def walk_chain(current_event:, delegations:, all_delegations:, visited_deleg_ids:, chain_acc:)
       current_holder =
         if current_event.type == "CONSENT_GRANTED"
           current_event.payload["supporterId"]
@@ -301,7 +321,7 @@ module ConsentEngine
         end
 
         # Otherwise, only descend if there is a path onward to @supporter_id.
-        next unless chain_reaches_target?(d, delegations, visited_deleg_ids + [d.event_id])
+        next unless chain_reaches_target?(d, all_delegations, visited_deleg_ids + [d.event_id])
 
         validation = validate_delegation_hop(d, current_event, new_chain)
         if validation
@@ -311,7 +331,8 @@ module ConsentEngine
 
         sub = walk_chain(
           current_event: d,
-          delegations: delegations,
+          delegations: all_delegations,
+          all_delegations: all_delegations,
           visited_deleg_ids: visited_deleg_ids + [d.event_id],
           chain_acc: new_chain
         )
@@ -354,6 +375,21 @@ module ConsentEngine
         return deny(ReasonCodes::DELEGATION_BEFORE_SOURCE, chain)
       end
 
+      # --- Seq-order revocation check (Round 2) ---
+      # A delegation appended AFTER a revocation event (in audit sequence)
+      # cannot claim authority even if its business effective_at is earlier.
+      # This blocks the race: revoke arrives first, then a late delegation
+      # tries to sneak in with a back-dated effective_at.
+      if source_event.type == "CONSENT_GRANTED"
+        revoke = revocation_event_for(source_event.event_id)
+        if revoke && d.seq > revoke.seq
+          return deny(ReasonCodes::DELEGATION_AFTER_REVOCATION, chain)
+        end
+        if revoke && revoke.effective_at <= @decision_at && revoke.seq < d.seq
+          return deny(ReasonCodes::DELEGATION_AFTER_REVOCATION, chain)
+        end
+      end
+
       # Delegation own expiry.
       d_to = d.payload["to"] ? Time.iso8601(d.payload["to"]) : nil
       if d_to && @decision_at >= d_to
@@ -375,7 +411,61 @@ module ConsentEngine
         end
       end
 
+      # --- Cumulative budget across sibling sub-delegations (Round 2) ---
+      if source_event.type == "CONSENT_GRANTED"
+        budget_error = check_cumulative_budget(source_event, d)
+        return budget_error if budget_error
+      end
+
       nil
+    end
+
+    # Find the revocation event (regardless of whether it is effective at
+    # decision time) — used for seq-order comparisons.
+    def revocation_event_for(consent_event_id)
+      @events.find do |e|
+        e.type == "CONSENT_REVOKED" &&
+          e.payload["consentId"] == consent_event_id
+      end
+    end
+
+    # Validates that all sibling delegations under +source_event+ do not
+    # collectively exceed the source's budget. The delegation +candidate+ is
+    # included in the tally only if it would be active at decision time;
+    # expired or not-yet-valid siblings are counted too (the budget was still
+    # consumed when they were created), which is the conservative choice.
+    def check_cumulative_budget(source_event, candidate)
+      siblings = @events.select do |e|
+        e.type == "DELEGATION_GRANTED" &&
+          e.payload["sourceConsentId"] == source_event.event_id
+      end
+
+      begin
+        DelegationBudget.new(
+          source_event, siblings, @decision_at, @seen_seq
+        ).verify!
+      rescue DelegationBudget::Exceeded => e
+        # Build a chain that includes the candidate for evidence, but do NOT
+        # leak other siblings' scopes in the reason code. The top-level code
+        # is DELEGATION_BUDGET_EXCEEDED — a stable, non-scope-enumerating code.
+        return deny(ReasonCodes::DELEGATION_BUDGET_EXCEEDED,
+                    chain_so_far_for(candidate))
+      end
+      nil
+    end
+
+    # When a budget violation is detected deep in walk_chain we don't always
+    # have the full accumulated chain handy, so reconstruct one that includes
+    # the source consent and the offending delegation.
+    def chain_so_far_for(delegation_event)
+      source = @events.find do |e|
+        e.type == "CONSENT_GRANTED" &&
+          e.event_id == delegation_event.payload["sourceConsentId"]
+      end
+      links = []
+      links << consent_link(source) if source
+      links << delegation_link(delegation_event)
+      links
     end
 
     def delegation_link(d)

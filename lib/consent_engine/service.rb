@@ -37,7 +37,7 @@ module ConsentEngine
 
     # --- consent ---
 
-    def grant_consent(consent_id:, person_id:, supporter_id:, scopes:, from:, to: nil, witness_id: nil, effective_at: nil)
+    def grant_consent(consent_id:, person_id:, supporter_id:, scopes:, from:, to: nil, witness_id: nil, emergency_minutes: nil, effective_at: nil)
       validate_id!(consent_id)
       validate_presence!(person_id, "person_id")
       validate_presence!(supporter_id, "supporter_id")
@@ -50,12 +50,13 @@ module ConsentEngine
         type: "CONSENT_GRANTED",
         effective_at: effective_at || from,
         payload: {
-          "personId"   => person_id,
-          "supporterId" => supporter_id,
-          "scopes"     => scopes,
-          "from"       => Time.iso8601(from.to_s).utc.iso8601,
-          "to"         => to ? Time.iso8601(to.to_s).utc.iso8601 : nil,
-          "witnessId"  => witness_id
+          "personId"        => person_id,
+          "supporterId"     => supporter_id,
+          "scopes"          => scopes,
+          "from"            => Time.iso8601(from.to_s).utc.iso8601,
+          "to"              => to ? Time.iso8601(to.to_s).utc.iso8601 : nil,
+          "witnessId"       => witness_id,
+          "emergencyMinutes" => emergency_minutes
         }
       )
     end
@@ -76,7 +77,7 @@ module ConsentEngine
 
     # --- delegation ---
 
-    def delegate(delegation_id:, source_consent_id:, from_supporter_id:, to_supporter_id:, scopes:, to: nil, effective_at: nil)
+    def delegate(delegation_id:, source_consent_id:, from_supporter_id:, to_supporter_id:, scopes:, to: nil, emergency_minutes: nil, effective_at: nil)
       validate_id!(source_consent_id)
       validate_scopes!(scopes)
 
@@ -95,7 +96,8 @@ module ConsentEngine
           "fromSupporterId"  => from_supporter_id,
           "toSupporterId"    => to_supporter_id,
           "scopes"           => scopes,
-          "to"               => to ? Time.iso8601(to.to_s).utc.iso8601 : nil
+          "to"               => to ? Time.iso8601(to.to_s).utc.iso8601 : nil,
+          "emergencyMinutes" => emergency_minutes
         }
       )
     end

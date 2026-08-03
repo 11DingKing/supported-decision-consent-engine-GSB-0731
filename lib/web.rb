@@ -68,6 +68,7 @@ module ConsentEngine
         from: p["from"],
         to: p["to"],
         witness_id: p["witnessId"],
+        emergency_minutes: p["emergencyMinutes"],
         effective_at: p["effectiveAt"] || p["from"]
       )
       status 201
@@ -96,6 +97,7 @@ module ConsentEngine
         to_supporter_id: p["toSupporterId"],
         scopes: p["scopes"],
         to: p["to"],
+        emergency_minutes: p["emergencyMinutes"],
         effective_at: p["effectiveAt"] || p["from"]
       )
       status 201
