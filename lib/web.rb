@@ -139,6 +139,7 @@ module ConsentEngine
       supporter_id = params["supporterId"]
       scope        = params["scope"]
       as_of        = params["asOf"]
+      idem_key     = params["idempotencyKey"] || env["HTTP_IDEMPOTENCY_KEY"]
 
       halt 400, JSON.generate({ error: "personId required" }) unless person_id
       halt 400, JSON.generate({ error: "scope required" })    unless scope
@@ -147,19 +148,24 @@ module ConsentEngine
         person_id: person_id,
         supporter_id: supporter_id,
         scope: scope,
-        as_of: as_of
+        as_of: as_of,
+        idempotency_key: idem_key
       )
+      response.headers["X-Idempotent-Replay"] = "true" if idem_key && service.find_decision_by_idempotency_key(idem_key)
       render_decision(d)
     end
 
     post "/decide" do
       p = parse_body!
+      idem_key = p["idempotencyKey"] || env["HTTP_IDEMPOTENCY_KEY"]
       d = service.decide(
         person_id: p["personId"],
         supporter_id: p["supporterId"],
         scope: p["scope"],
-        as_of: p["asOf"]
+        as_of: p["asOf"],
+        idempotency_key: idem_key
       )
+      response.headers["X-Idempotent-Replay"] = "true" if idem_key && service.find_decision_by_idempotency_key(idem_key)
       render_decision(d)
     end
 

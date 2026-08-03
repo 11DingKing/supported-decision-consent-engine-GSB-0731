@@ -64,13 +64,23 @@ module ConsentEngine
     def revoke_consent(revocation_id:, consent_id:, at:, effective_at: nil)
       validate_id!(consent_id)
       validate_time!(at, "at")
+
+      effective = effective_at ? Time.iso8601(effective_at.to_s) : Time.iso8601(at.to_s)
+      # Determine whether this revocation arrives after an earlier one was
+      # already recorded. The event is still appended (history is append-only)
+      # but carries an +outOfOrder+ flag so auditors can see it did not
+      # change the effective revocation time.
+      prior = prior_revocations(consent_id)
+      out_of_order = prior.any? { |r| r.effective_at < effective }
+
       @store.append(
         event_id: revocation_id,
         type: "CONSENT_REVOKED",
-        effective_at: effective_at || at,
+        effective_at: effective,
         payload: {
-          "consentId" => consent_id,
-          "at"        => Time.iso8601(at.to_s).utc.iso8601
+          "consentId"  => consent_id,
+          "at"         => Time.iso8601(at.to_s).utc.iso8601,
+          "outOfOrder" => out_of_order
         }
       )
     end
@@ -130,7 +140,20 @@ module ConsentEngine
     # Evaluate at +as_of+ (business time). If +as_of+ is nil the current
     # wall-clock time is used. The snapshot is pinned to the high seq at the
     # moment of the call, so later writes cannot change this answer.
-    def decide(person_id:, supporter_id:, scope:, as_of: nil, seen_seq: nil)
+    #
+    # If +idempotency_key+ is provided and a decision with the same key was
+    # already recorded, the prior decision is returned unchanged and NO new
+    # event is appended. This prevents duplicate submissions from expanding
+    # scope or resetting any budget.
+    def decide(person_id:, supporter_id:, scope:, as_of: nil, seen_seq: nil, idempotency_key: nil)
+      # Idempotency: if this exact key has already been used, replay the
+      # recorded decision rather than re-evaluating. This guarantees that
+      # retries cannot change scope, budget, or chain.
+      if idempotency_key
+        prior = find_decision_by_idempotency_key(idempotency_key)
+        return replay(prior.event_id) if prior
+      end
+
       decision_time = as_of ? Time.iso8601(as_of.to_s) : @store.clock.call
       seq = seen_seq || @store.high_seq
       events = @store.snapshot(seen_seq: seq)
@@ -145,7 +168,7 @@ module ConsentEngine
         emergency_config: @emergency_config
       )
 
-      record_decision(person_id, decision)
+      record_decision(person_id, decision, idempotency_key)
       decision
     end
 
@@ -175,24 +198,37 @@ module ConsentEngine
       @store.all
     end
 
+    def find_decision_by_idempotency_key(key)
+      @store.all.find do |e|
+        e.type == "DECISION_RECORDED" && e.payload["idempotencyKey"] == key
+      end
+    end
+
     private
 
-    def record_decision(person_id, decision)
-      id = "DECISION-#{decision.seen_seq}-#{decision.decision_at.to_i}-#{SecureRandom.hex(4)}"
+    def record_decision(person_id, decision, idempotency_key = nil)
+      id = idempotency_key || "DECISION-#{decision.seen_seq}-#{decision.decision_at.to_i}-#{SecureRandom.hex(4)}"
       @store.append(
         event_id: id,
         type: "DECISION_RECORDED",
         effective_at: decision.decision_at,
         payload: {
-          "personId"    => person_id,
-          "supporterId" => decision.subject_id,
-          "scope"       => decision.scope,
-          "decisionAt"  => decision.decision_at.utc.iso8601,
-          "seenSeq"     => decision.seen_seq,
-          "granted"     => decision.granted?,
-          "reasonCode"  => decision.reason_code
+          "personId"       => person_id,
+          "supporterId"    => decision.subject_id,
+          "scope"          => decision.scope,
+          "decisionAt"     => decision.decision_at.utc.iso8601,
+          "seenSeq"        => decision.seen_seq,
+          "granted"        => decision.granted?,
+          "reasonCode"     => decision.reason_code,
+          "idempotencyKey" => idempotency_key
         }
       )
+    end
+
+    def prior_revocations(consent_id)
+      @store.all.select do |e|
+        e.type == "CONSENT_REVOKED" && e.payload["consentId"] == consent_id
+      end
     end
 
     def extract_person_id(decision)

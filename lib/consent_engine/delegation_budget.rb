@@ -38,11 +38,19 @@ module ConsentEngine
     #                      sourceConsentId == source_event.event_id
     # @param decision_at   Time
     # @param seen_seq      Integer
-    def initialize(source_event, siblings, decision_at, seen_seq)
-      @source_event = source_event
-      @siblings     = siblings
-      @decision_at  = decision_at
-      @seen_seq     = seen_seq
+    # @param emergency_activations Array[Event] EMERGENCY_ACTIVATED events
+    #                      that have consumed some of the source's emergency
+    #                      budget. Each activation is counted as
+    #                      +emergencyMinutes+ (defaulting to the system
+    #                      max_minutes). This consumed budget survives
+    #                      revocation — it cannot be reset by revoking and
+    #                      re-granting.
+    def initialize(source_event, siblings, decision_at, seen_seq, emergency_activations: [])
+      @source_event         = source_event
+      @siblings             = siblings
+      @decision_at          = decision_at
+      @seen_seq             = seen_seq
+      @emergency_activations = emergency_activations
     end
 
     # Raises Exceeded if the aggregate budget is violated; returns true
@@ -94,7 +102,11 @@ module ConsentEngine
     end
 
     def total_emergency_minutes
-      @siblings.sum { |d| (d.payload["emergencyMinutes"] || 0).to_i }
+      delegated = @siblings.sum { |d| (d.payload["emergencyMinutes"] || 0).to_i }
+      activated = @emergency_activations.sum do |a|
+        (a.payload["emergencyMinutes"] || 0).to_i
+      end
+      delegated + activated
     end
 
     # --- checks ---

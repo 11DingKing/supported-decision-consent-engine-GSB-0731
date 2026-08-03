@@ -50,6 +50,22 @@ module ConsentEngine
     # state it claims; it must be rejected to preserve determinism.
     DELEGATION_LATE                = "DELEGATION_LATE"
 
+    # --- Round 3: revocation race / idempotent decision / budget survival ---
+    # A decision with the same idempotency key has already been recorded;
+    # the prior result is returned unchanged and no new event is appended.
+    DECISION_DUPLICATE             = "DECISION_DUPLICATE"
+    # A revocation event arrived out of order (its effective_at is earlier
+    # than a revocation already recorded for the same consent). The earliest
+    # revocation governs; this code is used when the later-arriving event
+    # would otherwise be mistaken for a state change.
+    REVOCATION_OUT_OF_ORDER        = "REVOCATION_OUT_OF_ORDER"
+    # A revocation was appended after a decision was already recorded, and
+    # the caller attempted to "re-decide" using a fresh snapshot — the prior
+    # decision's result is immutable, and this code signals that the replay
+    # was served from the pinned (decisionAt, seenSeq) rather than re-evaluated
+    # against the new log prefix.
+    DECISION_REPLAYED_PINNED       = "DECISION_REPLAYED_PINNED"
+
     # --- Emergency ---
     EMERGENCY_SCOPE_NOT_ALLOWED    = "EMERGENCY_SCOPE_NOT_ALLOWED"
     EMERGENCY_TIMEOUT              = "EMERGENCY_TIMEOUT"

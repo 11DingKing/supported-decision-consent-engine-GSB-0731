@@ -64,21 +64,26 @@ module ConsentEngine
         return deny(ReasonCodes::PERSON_OR_SUPPORTER_UNKNOWN)
       end
 
-      # 2. Emergency path: evaluated first because it may grant even when no
-      #    ordinary consent exists. It is still strictly scope- and time-bound.
-      emergency = evaluate_emergency
-      return emergency if emergency
-
-      # 3. Ordinary consent (direct from the person to the supporter).
+      # 2. Ordinary consent (direct from the person to the supporter).
+      #    Evaluated first because an explicit grant always wins.
       direct = evaluate_direct
       return direct if direct.granted?
 
-      # 4. Delegation chain.
+      # 3. Delegation chain.
       delegated = evaluate_delegation
       return delegated if delegated.granted?
 
-      # 5. Pick the most specific denial between direct and delegated.
-      stronger(direct, delegated)
+      # 4. Emergency path: only grants for the configured allowed scope, and
+      #    only if no ordinary consent or delegation already granted. It is
+      #    evaluated after ordinary paths so that a valid direct consent for
+      #    a different scope is not masked by EMERGENCY_SCOPE_NOT_ALLOWED.
+      emergency = evaluate_emergency
+      return emergency if emergency&.granted?
+
+      # 5. Pick the most specific denial among all paths.
+      candidates = [direct, delegated, emergency].compact
+      candidates.reduce { |best, d| stronger_denial?(d, best) ? d : best } ||
+        deny(ReasonCodes::SILENT_NO_CONSENT)
     end
 
     private
@@ -180,8 +185,10 @@ module ConsentEngine
       to_time   = consent_ev.payload["to"] ? Time.iso8601(consent_ev.payload["to"]) : nil
       witness   = consent_ev.payload["witnessId"]
 
-      # Revocation: a revoke at or before the decision time kills the grant.
-      revoke = revocation_for(consent_ev.event_id)
+      # Revocation: the EARLIEST effective revocation at or before the decision
+      # time governs. Out-of-order arrivals (a later-seq revoke with an earlier
+      # effective_at) are handled correctly because we compare business times.
+      revoke = earliest_revocation_for(consent_ev.event_id)
       if revoke
         if revoke.effective_at <= consent_ev.effective_at
           return deny(ReasonCodes::REVOKED_BEFORE_GRANT, [consent_link(consent_ev)])
@@ -401,7 +408,7 @@ module ConsentEngine
 
       # Source consent validity at decision time.
       if source_event.type == "CONSENT_GRANTED"
-        src_revoke = revocation_for(source_event.event_id)
+        src_revoke = earliest_revocation_for(source_event.event_id)
         if src_revoke && src_revoke.effective_at <= @decision_at
           return deny(ReasonCodes::DELEGATION_SOURCE_REVOKED, chain)
         end
@@ -440,14 +447,20 @@ module ConsentEngine
           e.payload["sourceConsentId"] == source_event.event_id
       end
 
+      # Emergency activations under this person also consume the source's
+      # emergency budget. This consumed budget survives revocation — it is
+      # counted regardless of whether the source is later revoked.
+      activations = @events.select do |e|
+        e.type == "EMERGENCY_ACTIVATED" &&
+          e.payload["personId"] == @person_id
+      end
+
       begin
         DelegationBudget.new(
-          source_event, siblings, @decision_at, @seen_seq
+          source_event, siblings, @decision_at, @seen_seq,
+          emergency_activations: activations
         ).verify!
       rescue DelegationBudget::Exceeded => e
-        # Build a chain that includes the candidate for evidence, but do NOT
-        # leak other siblings' scopes in the reason code. The top-level code
-        # is DELEGATION_BUDGET_EXCEEDED — a stable, non-scope-enumerating code.
         return deny(ReasonCodes::DELEGATION_BUDGET_EXCEEDED,
                     chain_so_far_for(candidate))
       end
@@ -482,12 +495,18 @@ module ConsentEngine
 
     # ---------- helpers ----------
 
-    def revocation_for(consent_event_id)
-      @events.find do |e|
-        e.type == "CONSENT_REVOKED" &&
-          e.payload["consentId"] == consent_event_id &&
-          e.effective_at <= @decision_at
-      end
+    # Earliest revocation (by business effective_at) that is active at or
+    # before @decision_at. Using the earliest rather than the first-by-seq
+    # means an out-of-order revocation (appended later but with an earlier
+    # effective time) still governs correctly.
+    def earliest_revocation_for(consent_event_id)
+      @events
+        .select do |e|
+          e.type == "CONSENT_REVOKED" &&
+            e.payload["consentId"] == consent_event_id &&
+            e.effective_at <= @decision_at
+        end
+        .min_by(&:effective_at)
     end
 
     def person_registered?
